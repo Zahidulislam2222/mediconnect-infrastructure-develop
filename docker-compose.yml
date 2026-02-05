@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  patient-service:
+    build:
+      context: ./backend_v2
+      dockerfile: patient-service/Dockerfile
+    ports:
+      - "8091:8081"
+    environment:
+      - NODE_ENV=development
+      - PORT=8081
+      - FRONTEND_URL=http://localhost:8080/
+      - AWS_REGION=us-east-1
+    volumes:
+      - ./backend_v2/patient-service:/app/patient-service
+      - ./backend_v2/shared:/app/shared
+    command: npm run dev
+
+  doctor-service:
+    build:
+      context: ./backend_v2
+      dockerfile: doctor-service/Dockerfile
+    ports:
+      - "8082:8082"
+    environment:
+      - NODE_ENV=development
+      - PORT=8082
+      - FRONTEND_URL=http://localhost:8080/
+      - AWS_REGION=us-east-1
+    volumes:
+      - ./backend_v2/doctor-service:/app/doctor-service
+      - ./backend_v2/shared:/app/shared
+    command: npm run dev
+
+  frontend:
+    build: ../mediconnect-hub
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_PATIENT_SERVICE_URL=http://localhost:8081
+      - VITE_DOCTOR_SERVICE_URL=http://localhost:8082
+    depends_on:
+      - patient-service
+      - doctor-service
