@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@google-cloud/pubsub": "^5.2.1",
+    "googleapis": "^169.0.0",
+    "uuid": "^13.0.0"
+  }
+}
