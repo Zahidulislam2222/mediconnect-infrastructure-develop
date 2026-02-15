@@ -1,98 +1,83 @@
 import { Pool, PoolClient } from 'pg';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-let pool: Pool | null = null;
-const ssmClient = new SSMClient({ region: process.env.AWS_REGION || 'us-east-1' });
-
-async function getSSMParameter(name: string, withDecryption: boolean = false): Promise<string | undefined> {
-    try {
-        const command = new GetParameterCommand({
-            Name: name,
-            WithDecryption: withDecryption,
-        });
-        const response = await ssmClient.send(command);
-        return response.Parameter?.Value;
-    } catch (error) {
-        console.error(`Failed to fetch SSM parameter ${name}:`, error);
-        throw error;
-    }
-}
+// Singleton pool instance
+export let pool: Pool | null = null;
 
 export async function initDb() {
     if (pool) return pool;
 
-    try {
-        const [host, password, user, poolId, clientId] = await Promise.all([
-            getSSMParameter('/mediconnect/prod/gcp/sql/public_ip'),
-            getSSMParameter('/mediconnect/prod/db/master_password', true),
-            getSSMParameter('/mediconnect/prod/gcp/sql/db_user'),
-            getSSMParameter('/mediconnect/prod/cognito/user_pool_id', true), // Add true here
-            getSSMParameter('/mediconnect/prod/cognito/client_id', true)    // Add true here
-        ]);
+    // 1. Validation: Ensure critical secrets exist before crashing the app
+    const host = process.env.DB_HOST;
+    const user = process.env.DB_USER;
+    const password = process.env.DB_PASSWORD;
+    const dbName = process.env.DB_NAME || 'mediconnect';
 
-        // Inject them into the process so the middleware can see them
-        process.env.COGNITO_USER_POOL_ID = poolId;
-        process.env.COGNITO_CLIENT_ID = clientId;
-
-        if (!host || !password || !user) {
-            throw new Error('Failed to retrieve database credentials from SSM');
-        }
-
-        console.log(`Connecting to Postgres at ${host}...`);
-
-        pool = new Pool({
-            host: host,
-            user: user,
-            password: password,
-            database: 'mediconnect', // Assuming DB name
-            port: 5432,
-            ssl: host === '127.0.0.1' ? false : { rejectUnauthorized: false }, // Disable SSL for local proxy
-            connectionTimeoutMillis: 20000, // 20s timeout to allow wake-up
-        });
-
-        // Test connection
-        const client = await getDbClient();
-        client.release();
-        console.log('Database initialized successfully.');
-
-        return pool;
-    } catch (error) {
-        console.error('Failed to initialize database:', error);
-        throw error;
+    if (!host || !user || !password) {
+        // Professional Logging: Critical Alert
+        console.error("❌ CRITICAL: Database configuration missing. Check Azure Environment Variables.");
+        throw new Error("Database configuration missing");
     }
+
+    console.log(`🔌 Initializing Database Connection to: ${host} (User: ${user})`);
+
+    // 2. Configure Pool with Production Settings
+    pool = new Pool({
+        host: host,
+        user: user,
+        password: password,
+        database: dbName,
+        port: 5432,
+        // HIPAA/GDPR Requirement: Encryption in Transit
+        ssl: host === '127.0.0.1' ? false : { rejectUnauthorized: false },
+        // Connection Resilience Settings
+        connectionTimeoutMillis: 5000, // Fail fast (5s) so probes detect issues
+        idleTimeoutMillis: 30000,      // Close idle clients to save resources
+        max: 20                        // Limit pool size to prevent exhausting DB connections
+    });
+
+    // 3. Pool Error Listener (Critical for stability)
+    // If a client loses connection (Azure kills idle TCP), this prevents the app from hanging.
+    pool.on('error', (err) => {
+        console.error('❌ Unexpected error on idle database client', err);
+        // Don't exit process here; PG pool handles reconnection for new clients
+    });
+
+    return pool;
 }
 
 export async function getDbClient(): Promise<PoolClient> {
-    if (!pool) {
-        await initDb();
-    }
+    if (!pool) await initDb();
 
-    // Retry logic for wake-up (6 times, 10s delay)
-    let retries = 6;
+    // 4. Retry Logic (Resilience)
+    // Azure cold starts can be slow. We retry connection 3 times.
+    let retries = 3;
     while (retries > 0) {
         try {
-            if (!pool) throw new Error('Pool not initialized');
-            const client = await pool.connect();
+            const client = await pool!.connect();
             return client;
         } catch (error: any) {
-            console.error(`Database connection failed. Retrying... (${retries} attempts left). Error: ${error.message}`);
+            console.warn(`⚠️ DB Connection Attempt Failed. Retrying... (${retries} attempts left). Error: ${error.message}`);
             retries--;
-            if (retries === 0) throw error;
-            await new Promise(resolve => setTimeout(resolve, 10000));
+            if (retries === 0) {
+                console.error("🔥 Fatal: Could not establish database connection after retries.");
+                throw error;
+            }
+            // Wait 2 seconds before retry
+            await new Promise(res => setTimeout(res, 2000));
         }
     }
-
-    throw new Error('Failed to connect to database after retries');
+    throw new Error('Database Connection Failed');
 }
 
+// Wrapper for simple queries
 export const query = async (text: string, params?: any[]) => {
     const client = await getDbClient();
     try {
         return await client.query(text, params);
     } finally {
-        client.release();
+        client.release(); // Always release the client back to the pool
     }
 };

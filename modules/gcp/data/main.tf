@@ -5,7 +5,7 @@ resource "google_sql_database_instance" "master" {
 
   settings {
     tier              = "db-f1-micro"
-    activation_policy = "ALWAYS"
+    activation_policy = "NEVER"
     availability_type = "ZONAL"
 
     backup_configuration {

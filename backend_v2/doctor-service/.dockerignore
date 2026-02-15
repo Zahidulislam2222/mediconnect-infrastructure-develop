@@ -1,0 +1,9 @@
+node_modules
+dist
+npm-debug.log
+error.log
+.git
+.env
+cloud-sql-proxy.exe
+debug.log
+*.md

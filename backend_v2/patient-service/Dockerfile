@@ -1,26 +1,33 @@
-# Use Node 20
+# --- PRODUCTION BUILD (Low RAM Optimized) ---
 FROM node:20-alpine
 
-WORKDIR /app
+# 1. Setup Work Directory
+WORKDIR /home/node/app
 
-# Copy shared logic and patient service
-COPY package.json ./
-COPY shared ./shared
-COPY patient-service ./patient-service
+# 🟢 FIX: Create folders & assign permissions BEFORE switching user
+RUN mkdir -p node_modules dist && chown -R node:node /home/node/app
 
-# Install dependencies for the whole project
-RUN npm install
+# 2. Switch to Secure User
+USER node
 
-# Move into patient service
-WORKDIR /app/patient-service
+# 🟢 KEEP PORT 8081
+ENV NODE_ENV=production
+ENV PORT=8081
 
-# --- THIS IS THE MISSING STEP ---
-# Install local dependencies and COMPILE TypeScript
-RUN npm install
-RUN npx tsc
+# 3. Copy Package Files
+COPY --chown=node:node patient-service/package*.json ./
 
-# Expose the dynamic port
-ENV PORT=8080
-EXPOSE 8080
+# 4. Install Production Dependencies
+RUN npm ci --omit=dev && npm cache clean --force
 
-CMD ["node", "dist/index.js"]
+# 5. Copy Pre-Compiled Code
+COPY --chown=node:node patient-service/dist ./dist
+
+# 6. Copy Metadata
+COPY --chown=node:node patient-service/package.json ./package.json
+
+EXPOSE 8081
+
+# 7. Start Service
+# Points exactly to where your tsconfig outputs the file
+CMD ["node", "dist/patient-service/src/index.js"]

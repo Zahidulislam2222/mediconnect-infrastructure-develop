@@ -1,0 +1,8 @@
+# Exclude the "heavy" stuff to make packing and uploading instant
+node_modules/
+**/node_modules/
+
+.git/
+.env
+.env.*
+npm-debug.log

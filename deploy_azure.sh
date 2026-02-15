@@ -1,31 +1,61 @@
 #!/bin/bash
-# Deploy Doctor Service to Azure Container Apps
+# MediConnect Enterprise Azure Deploy
+# Optimization: Pre-builds TypeScript on Host to save Docker RAM
+set -e
 
-# Config
+# 1. Configuration
 RG="mediconnect-rg"
 ACR="zahidmediconnectacr"
-ENV="mediconnect-env"
-IMAGE="$ACR.azurecr.io/doctor-service"
-LOCATION="eastus"
+APP_NAME="doctor-service"
+IMAGE_TAG="v-$(date +%Y%m%d-%H%M%S)"
 
-echo "Deploying to Azure Container Apps..."
+echo "🔹 Starting Professional Deployment for $APP_NAME..."
 
-# Login & Build
+# 2. HOST COMPILATION (Crucial for 8GB RAM)
+echo "⚙️  Compiling TypeScript locally (Host)..."
+
+# Navigate to service
+cd backend_v2/doctor-service
+
+# Install Dev Dependencies (needed for tsc)
+# If you already have node_modules, this is fast.
+npm install
+
+# Run the heavy compilation here on Windows (Better Memory Management)
+npm run build
+
+echo "✅ Compilation Complete. 'dist' folder ready."
+
+# Navigate back to root for Docker context
+cd ../..
+
+# 3. Docker Build & Push
+echo "🔑 Logging into Azure Registry..."
 az acr login --name $ACR
-docker build -t $IMAGE -f backend_v2/doctor-service/Dockerfile backend_v2
-docker push $IMAGE
 
-# Deploy
-az containerapp create \
-  --name doctor-service \
+echo "🐳 Building Docker Image (Packaging Only)..."
+# We use the root 'backend_v2' context so we can grab the 'dist' folder
+docker build --no-cache \
+  -t $ACR.azurecr.io/$APP_NAME:$IMAGE_TAG \
+  -f backend_v2/doctor-service/Dockerfile \
+  backend_v2
+
+echo "☁️ Pushing to Azure Container Registry..."
+docker push $ACR.azurecr.io/$APP_NAME:$IMAGE_TAG
+
+# 4. Deploy to Container Apps
+echo "🚀 Updating Container App Revision..."
+az containerapp update \
+  --name $APP_NAME \
   --resource-group $RG \
-  --environment $ENV \
-  --image $IMAGE \
-  --target-port 8082 \
-  --ingress 'external' \
-  --min-replicas 0 \
-  --max-replicas 10 \
-  --env-vars "NODE_ENV=production" "AWS_REGION=us-east-1" "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"
+  --image "$ACR.azurecr.io/$APP_NAME:$IMAGE_TAG" \
+  --set-env-vars NODE_ENV=production
 
-echo "Deployment Complete."
-az containerapp show --name doctor-service --resource-group $RG --query properties.configuration.ingress.fqdn
+# 5. Verification
+echo "🎯 Deployment Triggered Successfully."
+echo "🔍 Fetching Live Logs (Ctrl+C to exit log stream)..."
+az containerapp logs show \
+  --name $APP_NAME \
+  --resource-group $RG \
+  --tail 50 \
+  --follow

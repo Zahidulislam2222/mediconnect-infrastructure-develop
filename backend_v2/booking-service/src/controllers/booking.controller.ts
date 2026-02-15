@@ -4,14 +4,29 @@ import { PutCommand, QueryCommand, GetCommand, DeleteCommand, TransactWriteComma
 import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
 import Stripe from "stripe";
 import { randomUUID } from "crypto";
+import { logger } from '../../../shared/logger';
+import { writeAuditLog } from '../../../shared/audit';
+import { BookingPDFGenerator } from "../utils/pdf-generator";
+import { google } from 'googleapis';
+// REMOVE: import { Client } from 'pg'; 
+import { query } from '../config/db';
+
+interface AuthRequest extends Request {
+    user?: {
+        sub: string;
+        email_verified?: boolean;
+        // add other properties if needed
+    };
+}
 
 const TABLE_APPOINTMENTS = "mediconnect-appointments";
 const TABLE_LOCKS = "mediconnect-booking-locks";
 const TABLE_PATIENTS = "mediconnect-patients";
 const TABLE_TRANSACTIONS = "mediconnect-transactions";
 const TABLE_SCHEDULES = "mediconnect-doctor-schedules";
-const STRIPE_SECRET_NAME = "mediconnect/stripe/keys";
+const STRIPE_SECRET_NAME = "/mediconnect/stripe/keys";
 const CLEANUP_SECRET_PARAM = "/mediconnect/prod/cleanup/secret";
+const TABLE_GRAPH = "mediconnect-graph-data"; // 🟢 Added for Care Network
 
 const normalizeTimeSlot = (isoString: string) => {
     if (!isoString) return new Date().toISOString();
@@ -28,8 +43,14 @@ export const createBooking = async (req: Request, res: Response) => {
     try {
         const {
             patientId, patientName, doctorId, doctorName, timeSlot, paymentToken,
-            insuranceProvider, policyId, priority = "Low", reason = "General Checkup"
+            priority = "Low", reason = "General Checkup"
         } = req.body;
+
+        // [REPLACE THE ERROR LINE WITH THIS]
+        const authReq = req as AuthRequest;
+        if (authReq.user && authReq.user.sub !== patientId) {
+            return res.status(403).json({ message: "Identity Spoofing Detected." });
+        }
 
         if (!timeSlot || !patientId || !doctorId) {
             return res.status(400).json({ message: "Missing required booking fields" });
@@ -76,11 +97,31 @@ export const createBooking = async (req: Request, res: Response) => {
         }
 
         // 3. Payment Processing
-        const BASE_FEE = 5000; // in cents
-        // Example insurance logic
-        const amountToCharge = (insuranceProvider && policyId) ? Math.round(BASE_FEE * 0.40) : BASE_FEE;
+        // 🟢 SECURE PRICING LOGIC (Admin Controlled)
 
-        const stripeKey = await getSecret(STRIPE_SECRET_NAME);
+        let amountToCharge = 5000; // Default $50.00 (in cents)
+
+        // ✅ NEW LOGIC: Use shared pool (No 'new Client', no 'connect', no 'end')
+        try {
+            const priceRes = await query(
+                "SELECT data->>'consultationFee' as fee FROM doctors WHERE id = $1", 
+                [doctorId]
+            );
+            
+            if (priceRes.rows.length > 0) {
+                const rawFee = priceRes.rows[0].fee;
+                if (rawFee) {
+                    // Convert "80" -> 8000
+                    amountToCharge = Math.round(Number(rawFee) * 100);
+                    console.log(`✅ Dynamic Price Found: $${rawFee} -> ${amountToCharge} cents`);
+                }
+            }
+        } catch (dbError) {
+            console.warn("⚠️ Could not fetch dynamic price, using default $50", dbError);
+            // We continue with default price to not block service
+        } 
+
+        const stripeKey = await getSSMParameter(STRIPE_SECRET_NAME, true);
         if (!stripeKey) throw new Error("Stripe secret not found");
 
         stripeInstance = new Stripe(stripeKey);
@@ -89,8 +130,15 @@ export const createBooking = async (req: Request, res: Response) => {
                 amount: amountToCharge,
                 currency: "usd",
                 payment_method: paymentToken || "pm_card_visa",
-                confirm: true,
-                metadata: { appointmentId, doctorId, patientId, billId: transactionId },
+                confirm: true, // This confirms the card is valid
+                capture_method: 'manual', // <--- CRITICAL: Do not take money yet
+                metadata: {
+                    appointmentId,
+                    doctorId,
+                    patientId,
+                    billId: transactionId,
+                    type: 'BOOKING_FEE' // Added for Webhook clarity
+                },
                 automatic_payment_methods: { enabled: true, allow_redirects: 'never' }
             });
             paymentIntentId = paymentIntent.id;
@@ -101,58 +149,63 @@ export const createBooking = async (req: Request, res: Response) => {
             return res.status(402).json({ error: "Payment Failed", details: paymentError.message });
         }
 
+        // 🟢 FHIR TRANSFORMATION: Appointment (R4)
+        const appointmentEnd = new Date(new Date(normalizedTime).getTime() + 30 * 60000).toISOString();
+        const fhirResource = {
+            resourceType: "Appointment",
+            id: appointmentId,
+            status: "booked",
+            description: reason,
+            start: normalizedTime,
+            end: appointmentEnd,
+            created: timestamp,
+            participant: [
+                { actor: { reference: `Patient/${patientId}`, display: patientName }, status: "accepted" },
+                { actor: { reference: `Practitioner/${doctorId}`, display: doctorName }, status: "accepted" }
+            ],
+            serviceType: [{ coding: [{ code: "general", display: "General Practice" }] }]
+        };
+
         // 4. TransactWriteItems (Atomic Commit)
-        // Ops:
-        // 1. Put Appointment
-        // 2. Put Transaction
-        // 3. Delete Lock (or update status, but usually we keep it or delete it. Plan said delete/update. Let's Delete to free up space, duplicate check handled by business logic or if we want to keep it as a tombstone, but slots are distinct.)
-        // Actually, if we delete the lock immediately, someone else might book it if we don't put the appointment first?
-        // Wait, the appointment table primary key should prevent duplicates if it's based on time?
-        // Usually Appointment ID is UUID.
-        // We should KEEP the lock BUT change status to BOOKED to prevent others from taking it, OR rely on a GSI or logic to check appointments.
-        // The legacy code used TABLE_LOCKS just for temporary holding.
-        // Let's UPDATE the lock to "CONFIRMED" or just Delete it if the Appointment record itself acts as the source of truth for "Slot Taken".
-        // The legacy code didn't seem to check Appointment table for conflict in `mediconnect-book-appointment` line 174, it checked `TABLE_LOCKS`.
-        // So we must KEEP the lock item effectively, or ensure the Appointment check covers it.
-        // Let's UPDATING the lock to "BOOKED" and ensure it expires later or stays.
-        // Actually, creating the Appointment IS the final record.
-        // Let's Delete the lock as the Appointment now exists... BUT, does the `createBooking` check `TABLE_APPOINTMENTS`? No.
-        // It relies on `TABLE_LOCKS`. So we should probably keep the lock as a permanent record OR have a way to check appointments.
-        // Standard pattern: The Lock table is for ephemeral concurrency. The Appointment table is permanent.
-        // To be safe and simple: Update Lock to "BOOKED" so checks on Lock Table still fail for others.
 
         try {
             await docClient.send(new TransactWriteCommand({
-                TransactItems: [
-                    {
-                        Put: {
-                            TableName: TABLE_APPOINTMENTS,
-                            Item: {
-                                appointmentId, patientId, patientName, doctorId, doctorName,
-                                timeSlot: normalizedTime, status: "CONFIRMED",
-                                paymentStatus: "paid", paymentId: paymentIntentId,
-                                createdAt: timestamp,
-                                insuranceProvider: insuranceProvider || "N/A", policyId: policyId || "N/A",
-                                amountPaid: amountToCharge / 100, coverageType: (insuranceProvider && policyId) ? "INSURANCE_40_PERCENT" : "NONE",
-                                priority, reason, patientAvatar, patientAge, triageStatus: "WAITING"
+            TransactItems: [
+                {
+                    Put: {
+                        TableName: TABLE_APPOINTMENTS,
+                        Item: {
+                            appointmentId, patientId, patientName, doctorId, doctorName,
+                            timeSlot: normalizedTime, status: "CONFIRMED",
+                            paymentStatus: "paid", paymentId: paymentIntentId,
+                            createdAt: timestamp,
+                            
+                            // 🟢 MAKE SURE THIS USES 'amountToCharge'
+                            amountPaid: amountToCharge / 100, 
+                            
+                            coverageType: "NONE",
+                            priority, reason, patientAvatar, patientAge, triageStatus: "WAITING",
+                            resource: fhirResource
+                        }
+                    }
+                },
+                {
+                    Put: {
+                        TableName: TABLE_TRANSACTIONS,
+                        Item: {
+                            billId: transactionId, referenceId: appointmentId,
+                            patientId, doctorId, type: "BOOKING_FEE",
+                            
+                            amount: amountToCharge / 100, 
+                            
+                            currency: "USD",
+                            status: "PAID", createdAt: timestamp,
+                            description: `Consultation with ${doctorName}`,
+                            paymentIntentId: paymentIntentId
                             }
                         }
                     },
                     {
-                        Put: {
-                            TableName: TABLE_TRANSACTIONS,
-                            Item: {
-                                billId: transactionId, referenceId: appointmentId,
-                                patientId, doctorId, type: "BOOKING_FEE",
-                                amount: amountToCharge / 100, currency: "USD",
-                                status: "PAID", createdAt: timestamp,
-                                description: `Consultation with ${doctorName}`,
-                                paymentIntentId: paymentIntentId
-                            }
-                        }
-                    },
-                    {
-                        // Update Lock to Booked prevents race conditions if we rely on Lock table for "Is Slot Taken"
                         Update: {
                             TableName: TABLE_LOCKS,
                             Key: { lockId: lockKey },
@@ -160,9 +213,52 @@ export const createBooking = async (req: Request, res: Response) => {
                             ExpressionAttributeNames: { "#s": "status" },
                             ExpressionAttributeValues: { ":s": "BOOKED", ":aid": appointmentId }
                         }
+                    },
+                    // 🟢 NEW: Automatic Graph Link (Patient -> Doctor)
+                    {
+                        Put: {
+                            TableName: TABLE_GRAPH,
+                            Item: {
+                                PK: `PATIENT#${patientId}`,
+                                SK: `DOCTOR#${doctorId}`,
+                                relationship: "isTreatedBy",
+                                doctorName: doctorName,
+                                lastVisit: normalizedTime,
+                                createdAt: timestamp
+                            }
+                        }
+                    },
+                    // 🟢 NEW: Automatic Graph Link (Doctor -> Patient)
+                    {
+                        Put: {
+                            TableName: TABLE_GRAPH,
+                            Item: {
+                                PK: `DOCTOR#${doctorId}`,
+                                SK: `PATIENT#${patientId}`,
+                                relationship: "treats",
+                                patientName: patientName,
+                                lastVisit: normalizedTime,
+                                createdAt: timestamp
+                            }
+                        }
                     }
                 ]
             }));
+
+            // 🟢 AUDIT LOG
+            await writeAuditLog(patientId, patientId, "CREATE_BOOKING", `Appointment ${appointmentId} booked`, { doctorId, timeSlot: normalizedTime });
+
+            if (stripeInstance && paymentIntentId) {
+                try {
+                    await stripeInstance.paymentIntents.capture(paymentIntentId);
+                    logger.info(`Payment captured for ${appointmentId}`);
+                    syncToGoogleCalendar(doctorId, normalizedTime, patientName, reason);
+                } catch (captureError) {
+                    // Very rare edge case: DB wrote, but Capture failed (e.g., Stripe down).
+                    // In a real prod env, you would log this to a "Manual Review" queue.
+                    logger.error("CRITICAL: DB Write Success but Payment Capture Failed", { appointmentId, paymentIntentId });
+                }
+            }
 
             res.status(200).json({
                 message: "Appointment Secured",
@@ -173,21 +269,28 @@ export const createBooking = async (req: Request, res: Response) => {
             });
 
         } catch (dbError: any) {
-            console.error("Transaction Failed. Initiating Refund.", dbError);
-            // CRITICAL: Refund Stripe
+            console.error("Transaction Failed. Releasing Payment Hold.", dbError);
+
+            // --- START CHANGE: Cancel/Void Authorization ---
             if (stripeInstance && paymentIntentId) {
-                try { await stripeInstance.refunds.create({ payment_intent: paymentIntentId }); } catch (e) {
-                    console.error("Refund failed dramatically:", e);
+                try {
+                    // .cancel() releases the hold instantly. Much better than .refund()
+                    await stripeInstance.paymentIntents.cancel(paymentIntentId);
+                    logger.info(`Payment hold released for ${paymentIntentId}`);
+                } catch (e) {
+                    console.error("Cancel failed:", e);
                 }
             }
-            // Release Lock (Delete it so user can try again)
+            // --- END CHANGE ---
+
+            // Release Lock
             try { await docClient.send(new DeleteCommand({ TableName: TABLE_LOCKS, Key: { lockId: lockKey } })); } catch (e) { }
 
-            res.status(500).json({ error: "System Error. Payment refunded." });
+            res.status(500).json({ error: "System Error. Payment hold released." });
         }
 
     } catch (error: any) {
-        console.error("CRASH:", error);
+        logger.error("Booking System Crash", { error });
         // If lock was acquired but code crashed before transaction?
         // The transaction is atomic, so if it failed, nothing happened to DB.
         // But we acquired lock in step 2.
@@ -202,6 +305,7 @@ export const getAppointments = async (req: Request, res: Response) => {
     try {
         const { doctorId, patientId } = req.query;
 
+        // 1. Fetch for Patient
         if (patientId) {
             const command = new QueryCommand({
                 TableName: TABLE_APPOINTMENTS,
@@ -214,6 +318,7 @@ export const getAppointments = async (req: Request, res: Response) => {
             return res.status(200).json({ existingBookings: response.Items || [] });
         }
 
+        // 2. Fetch for Doctor (Only returns Bookings now)
         if (doctorId) {
             const bookingCommand = new QueryCommand({
                 TableName: TABLE_APPOINTMENTS,
@@ -221,20 +326,12 @@ export const getAppointments = async (req: Request, res: Response) => {
                 KeyConditionExpression: "doctorId = :did",
                 ExpressionAttributeValues: { ":did": doctorId },
             });
-            const scheduleCommand = new GetCommand({
-                TableName: TABLE_SCHEDULES,
-                Key: { doctorId: String(doctorId) }
-            });
 
-            const [bookingRes, scheduleRes] = await Promise.all([
-                docClient.send(bookingCommand),
-                docClient.send(scheduleCommand)
-            ]);
+            const bookingRes = await docClient.send(bookingCommand);
 
+            // 🟢 FIX: Remove scheduleCommand. Schedule now comes from Doctor Service.
             return res.status(200).json({
-                existingBookings: bookingRes.Items || [],
-                weeklySchedule: scheduleRes.Item?.schedule || {},
-                timezone: scheduleRes.Item?.timezone || "UTC"
+                existingBookings: bookingRes.Items || []
             });
         }
 
@@ -265,7 +362,7 @@ export const cleanupAppointments = async (req: Request, res: Response) => {
 
         const appointments = scanRes.Items || [];
         const now = new Date();
-        const stripeKey = await getSecret(STRIPE_SECRET_NAME);
+        const stripeKey = await getSSMParameter(STRIPE_SECRET_NAME, true)
         const stripe = stripeKey ? new Stripe(stripeKey) : null;
         let processed = 0;
 
@@ -305,21 +402,293 @@ export const cleanupAppointments = async (req: Request, res: Response) => {
     }
 };
 
+export const cancelBookingUser = async (req: Request, res: Response) => {
+    try {
+        const { appointmentId, patientId } = req.body;
+        const authReq = req as AuthRequest;
+
+        if (authReq.user && authReq.user.sub !== patientId) {
+            return res.status(403).json({ message: "Identity mismatch." });
+        }
+
+        const getCmd = new GetCommand({
+            TableName: TABLE_APPOINTMENTS,
+            Key: { appointmentId }
+        });
+        const aptRes = await docClient.send(getCmd);
+        const apt = aptRes.Item;
+
+        if (!apt) return res.status(404).json({ message: "Appointment not found" });
+
+        // 1. Refund Logic
+        let refundId = "NOT_APPLICABLE";
+        if (apt.paymentId && apt.paymentId !== "TEST_MODE") {
+            try {
+                const stripeKey = await getSSMParameter(STRIPE_SECRET_NAME, true);
+                if (stripeKey) {
+                    const stripe = new Stripe(stripeKey);
+                    const refund = await stripe.refunds.create({ payment_intent: apt.paymentId });
+                    refundId = refund.id;
+                }
+            } catch (e: any) {
+                console.error("Stripe Refund Failed:", e.message);
+                refundId = "REFUND_FAILED_MANUAL_REQUIRED";
+            }
+        }
+
+        // 2. Update Appointment Status
+        let updateExpression = "set #s = :s";
+        const expressionAttributeValues: any = { ":s": "CANCELLED" };
+        const expressionAttributeNames: any = { "#s": "status" };
+
+        if (apt.resource) {
+            updateExpression += ", #res.#rs = :cancelled";
+            expressionAttributeNames["#res"] = "resource";
+            expressionAttributeNames["#rs"] = "status";
+            expressionAttributeValues[":cancelled"] = "cancelled";
+        }
+
+        await docClient.send(new UpdateCommand({
+            TableName: TABLE_APPOINTMENTS,
+            Key: { appointmentId },
+            UpdateExpression: updateExpression,
+            ExpressionAttributeNames: expressionAttributeNames,
+            ExpressionAttributeValues: expressionAttributeValues
+        }));
+
+        // ---------------------------------------------------------
+        // 🟢 FIX: DELETE THE LOCK SO THE SLOT OPENS UP
+        // ---------------------------------------------------------
+        if (apt.doctorId && apt.timeSlot) {
+            try {
+                // Ensure helper function 'normalizeTimeSlot' is available in this file
+                const lockKey = `${apt.doctorId}#${normalizeTimeSlot(apt.timeSlot)}`;
+                
+                await docClient.send(new DeleteCommand({
+                    TableName: TABLE_LOCKS,
+                    Key: { lockId: lockKey }
+                }));
+                console.log(`🔓 Lock released for ${lockKey}`);
+            } catch (lockError) {
+                console.error("Failed to release lock:", lockError);
+            }
+        }
+        // ---------------------------------------------------------
+
+        // 3. Audit Log
+        try {
+            await writeAuditLog(patientId, patientId, "CANCEL_BOOKING", `Appointment ${appointmentId} cancelled`, { reason: "User requested" });
+        } catch (e) { console.warn("Audit log failed but continuing..."); }
+
+        // 4. Ledger Entry (Refund Transaction)
+        const transactionId = randomUUID();
+        await docClient.send(new PutCommand({
+            TableName: TABLE_TRANSACTIONS,
+            Item: {
+                billId: transactionId,
+                referenceId: appointmentId,
+                patientId,
+                doctorId: apt.doctorId || "UNKNOWN",
+                type: "REFUND",
+                amount: -(apt.amountPaid || 0),
+                currency: "USD",
+                status: "PROCESSED",
+                createdAt: new Date().toISOString(),
+                description: "User requested cancellation"
+            }
+        }));
+
+        res.status(200).json({ message: "Appointment cancelled and refunded" });
+
+    } catch (error: any) {
+        console.error("Cancel Error (Full Trace):", error);
+        res.status(500).json({ error: error.message });
+    }
+};
+
+// REPLACE 'checkInPatient' (bottom of file) with this:
+
+export const updateAppointment = async (req: Request, res: Response) => {
+    try {
+        const { appointmentId, patientArrived, status } = req.body;
+
+        if (!appointmentId) {
+            return res.status(400).json({ message: "Missing appointmentId" });
+        }
+
+        // 🛡️ SECURITY: Request must be authenticated (handled by authMiddleware)
+        // If req.user is missing, authMiddleware would have blocked it.
+
+        // Build Dynamic Update for DynamoDB (Atomic Operation)
+        let updateExpression = "set lastUpdated = :now";
+        const expressionAttributeValues: any = { ":now": new Date().toISOString() };
+        const expressionAttributeNames: any = {};
+
+        // 1. Handle Patient Check-In
+        if (patientArrived !== undefined) {
+            updateExpression += ", patientArrived = :pa";
+            expressionAttributeValues[":pa"] = patientArrived;
+        }
+
+        // 2. Handle Queue Status (Doctor Actions: IN_PROGRESS, COMPLETED)
+        if (status) {
+            updateExpression += ", #s = :s";
+            expressionAttributeNames["#s"] = "status";
+            expressionAttributeValues[":s"] = status;
+        }
+
+        await docClient.send(new UpdateCommand({
+            TableName: TABLE_APPOINTMENTS,
+            Key: { appointmentId },
+            UpdateExpression: updateExpression,
+            ExpressionAttributeNames: Object.keys(expressionAttributeNames).length > 0 ? expressionAttributeNames : undefined,
+            ExpressionAttributeValues: expressionAttributeValues
+        }));
+
+        res.status(200).json({ message: "Appointment updated successfully" });
+
+    } catch (error: any) {
+        console.error("Update Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+};
+
+// ↓↓↓ REPLACE THE EXISTING 'cancelAppointment' FUNCTION AT THE BOTTOM OF THE FILE ↓↓↓
+
 async function cancelAppointment(apt: any, newStatus: string, refundId: string) {
     try {
+        // 1. Prepare Update Logic (Legacy + FHIR)
+        let updateExpression = "set #s = :s, refundId = :r, lastUpdated = :now";
+        const expressionAttributeValues: any = {
+            ":s": newStatus,
+            ":r": refundId,
+            ":now": new Date().toISOString()
+        };
+        const expressionAttributeNames: any = { "#s": "status" };
+
+        // 🟢 FHIR R4 FIX: Also update the 'resource' object if it exists
+        // This ensures the FHIR data matches the legacy status
+        if (apt.resource) {
+            updateExpression += ", #res.#rs = :cancelled";
+            expressionAttributeNames["#res"] = "resource";
+            expressionAttributeNames["#rs"] = "status";
+            expressionAttributeValues[":cancelled"] = "cancelled";
+        }
+
+        // 2. Execute Atomic Update
         await docClient.send(new UpdateCommand({
             TableName: TABLE_APPOINTMENTS,
             Key: { appointmentId: apt.appointmentId },
-            UpdateExpression: "set #s = :s, refundId = :r, lastUpdated = :now",
-            ExpressionAttributeNames: { "#s": "status" },
-            ExpressionAttributeValues: { ":s": newStatus, ":r": refundId, ":now": new Date().toISOString() }
+            UpdateExpression: updateExpression,
+            ExpressionAttributeNames: expressionAttributeNames,
+            ExpressionAttributeValues: expressionAttributeValues
         }));
 
+        // 3. Release the Time Slot Lock
         if (apt.doctorId && apt.timeSlot) {
             const lockKey = `${apt.doctorId}#${normalizeTimeSlot(apt.timeSlot)}`;
-            await docClient.send(new DeleteCommand({ TableName: TABLE_LOCKS, Key: { lockId: lockKey } }));
+            await docClient.send(new DeleteCommand({
+                TableName: TABLE_LOCKS,
+                Key: { lockId: lockKey }
+            }));
+            console.log(`🔓 Lock released for ${lockKey}`);
         }
     } catch (e) {
         console.error("Cancel update failed", e);
+    }
+}
+
+
+export const getReceipt = async (req: Request, res: Response) => {
+    try {
+        const { appointmentId } = req.params;
+        const userId = (req as any).user.sub;
+
+        const getCmd = new GetCommand({
+            TableName: TABLE_APPOINTMENTS,
+            Key: { appointmentId }
+        });
+        const result = await docClient.send(getCmd);
+        const apt = result.Item;
+
+        if (!apt) return res.status(404).json({ message: "Appointment not found" });
+        if (apt.patientId !== userId) return res.status(403).json({ message: "Unauthorized" });
+
+        // 🟢 LOGICAL FIX: Determine type and status based on database state
+        const isCancelled = apt.status.includes("CANCELLED");
+
+        const generator = new BookingPDFGenerator();
+        const url = await generator.generateReceipt({
+            appointmentId: apt.appointmentId,
+            billId: apt.paymentId || "N/A",
+            patientName: apt.patientName,
+            doctorName: apt.doctorName,
+            amount: apt.amountPaid || 50,
+            date: apt.timeSlot,
+            // If cancelled, show REFUNDED, else show PAID
+            status: isCancelled ? "REFUNDED" : "PAID",
+            // If cancelled, use REFUND theme, else use BOOKING theme
+            type: isCancelled ? "REFUND" : "BOOKING"
+        });
+
+        res.status(200).json({ downloadUrl: url });
+
+    } catch (error: any) {
+        console.error("Receipt Generation Error:", error);
+        res.status(500).json({ error: "Could not generate receipt" });
+    }
+};
+
+// 🟢 NEW HELPER: Sync to Google Calendar
+// This reads the Doctor's token from Postgres (GCP) and pushes to Google
+async function syncToGoogleCalendar(doctorId: string, timeSlot: string, patientName: string, reason: string) {
+    try {
+        // 1. Get Refresh Token (Using shared pool)
+        const res = await query("SELECT data->>'googleRefreshToken' as token FROM doctors WHERE id = $1", [doctorId]);
+        
+        // Safety check: if no rows returned
+        if (!res.rows || res.rows.length === 0) {
+             console.log(`[Calendar] Doctor ${doctorId} not found in SQL`);
+             return;
+        }
+
+        const refreshToken = res.rows[0]?.token;
+
+        if (!refreshToken) {
+            console.log(`[Calendar] No Google Token found for doctor ${doctorId}`);
+            return;
+        }
+
+        // 2. Authenticate Google Client
+        const oauth2Client = new google.auth.OAuth2(
+            process.env.GOOGLE_CLIENT_ID,
+            process.env.GOOGLE_CLIENT_SECRET,
+            process.env.GOOGLE_REDIRECT_URI
+        );
+        oauth2Client.setCredentials({ refresh_token: refreshToken });
+        const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+        // 3. Create Event
+        const startTime = new Date(timeSlot);
+        const endTime = new Date(startTime.getTime() + 30 * 60000); // 30 mins duration
+
+        await calendar.events.insert({
+            calendarId: 'primary',
+            requestBody: {
+                summary: `Consultation: ${patientName}`,
+                description: `Reason: ${reason}\n\nManaged by MediConnect`,
+                start: { dateTime: startTime.toISOString() },
+                end: { dateTime: endTime.toISOString() },
+                reminders: {
+                    useDefault: false,
+                    overrides: [{ method: 'popup', minutes: 10 }]
+                }
+            }
+        });
+
+        console.log(`[Calendar] Event created for ${doctorId}`);
+
+    } catch (error: any) {
+        console.error("[Calendar Sync Failed]:", error.message);
     }
 }

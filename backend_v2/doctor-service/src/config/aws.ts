@@ -18,19 +18,21 @@ const secretCache: Record<string, string> = {};
  * @param isSecure If true, decrypts the parameter
  */
 export const getSSMParameter = async (path: string, isSecure: boolean = false): Promise<string | undefined> => {
+    // 🟢 REACTIVE FIX: Check memory cache first
+    const envMap: Record<string, string | undefined> = {
+        '/mediconnect/prod/kms/signing_key_id': process.env.KMS_KEY_ID,
+        '/mediconnect/prod/cognito/client_id': process.env.COGNITO_CLIENT_ID,
+        '/mediconnect/prod/cognito/user_pool_id': process.env.COGNITO_USER_POOL_ID
+    };
+
+    if (envMap[path]) return envMap[path];
     if (secretCache[path]) return secretCache[path];
 
     try {
-        const command = new GetParameterCommand({
-            Name: path,
-            WithDecryption: isSecure
-        });
+        const command = new GetParameterCommand({ Name: path, WithDecryption: isSecure });
         const response = await ssmClient.send(command);
         const value = response.Parameter?.Value;
-
-        if (value) {
-            secretCache[path] = value;
-        }
+        if (value) secretCache[path] = value;
         return value;
     } catch (error) {
         console.error(`Failed to fetch SSM parameter: ${path}`, error);

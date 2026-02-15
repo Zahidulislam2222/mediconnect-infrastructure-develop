@@ -23,7 +23,7 @@ export class PDFGenerator {
     constructor() {
         this.s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
         this.kmsClient = new KMSClient({ region: process.env.AWS_REGION || "us-east-1" });
-        this.bucketName = process.env.DOCS_BUCKET || "mediconnect-temp-docs";
+        this.bucketName = process.env.S3_BUCKET_PRESCRIPTIONS || "mediconnect-prescriptions"
         this.kmsKeyId = process.env.KMS_KEY_ID || "";
     }
 

@@ -1,5 +1,0 @@
-src/index.ts(67,36): error TS6059: File 'C:/Dev/mediconnect-project/mediconnect-infrastructure-develop/backend_v2/shared/logger.ts' is not under 'rootDir' 'C:/Dev/mediconnect-project/mediconnect-infrastructure-develop/backend_v2/doctor-service/src'. 'rootDir' is expected to contain all source files.
-  The file is in the program because:
-    Imported via '../../shared/logger' from file 'C:/Dev/mediconnect-project/mediconnect-infrastructure-develop/backend_v2/doctor-service/src/index.ts'
-    Matched by include pattern '../shared/**/*' in 'C:/Dev/mediconnect-project/mediconnect-infrastructure-develop/backend_v2/doctor-service/tsconfig.json'
-../shared/logger.ts(1,21): error TS2307: Cannot find module 'winston' or its corresponding type declarations.

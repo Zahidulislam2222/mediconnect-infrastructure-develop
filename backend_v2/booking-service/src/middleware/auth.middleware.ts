@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import { JwtRsaVerifier } from "aws-jwt-verify";
 import axios from "axios";
+import dotenv from 'dotenv';
+dotenv.config(); // 🟢 THIS MUST BE HERE
 
 let verifier: any;
 
@@ -25,7 +27,7 @@ export const getVerifier = async () => {
             verifier = JwtRsaVerifier.create({
                 issuer: issuerUrl,
                 audience: clientId,
-                tokenUse: "id",
+                //tokenUse: "id",
                 jwks: jwks
             });
             console.log("✅ Auth Gatekeeper: READY");

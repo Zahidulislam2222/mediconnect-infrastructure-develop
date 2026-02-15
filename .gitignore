@@ -1,38 +1,59 @@
-# Dependencies
+# --- Dependencies & Build ---
 node_modules/
 dist/
-jspdf/
+build/
+*.tsbuildinfo
 
-# Terraform & Infrastructure
-.terraform/
-*.tfstate
-*.tfstate.backup
-.terraform.lock.hcl
-*.tfvars
-terraform.tfvars
-environments/prod/gcp_key.json
-environments/prod/terraform.tfvars
-params.json
-
-# Secrets & Environment (CRITICAL)
+# --- Environment & Secrets (CRITICAL) ---
 .env
 .env.*
-!.env.example
 *.pem
 *.key
-gcp_key.json
-credentials.json
+*.json
+!package.json
+!tsconfig.json
+!app.json
+!gcp_key.json.example
 
-# Logs & Debugging
+# --- Terraform (CRITICAL) ---
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+.terraform.lock.hcl
+
+# --- Specific Keys from your screenshots ---
+gcp_key.json
+params.json
+
+# --- Logs & Debugging ---
 logs
 *.log
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-.DS_Store
+debug.log
+tsc_error.txt
 
-# OS Files
+# --- OS & IDE ---
 .DS_Store
+.idea/
+.vscode/
 Thumbs.db
+
+# --- Binaries & Executables (Remove that .exe I saw) ---
+*.exe
+*.dll
+*.so
+*.dylib
+cloud-sql-proxy.exe
+
+# --- Python (Migration App) ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/

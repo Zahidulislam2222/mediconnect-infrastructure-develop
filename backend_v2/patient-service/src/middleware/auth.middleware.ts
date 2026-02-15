@@ -6,7 +6,6 @@ let verifier: any;
 
 const getVerifier = async () => {
     if (!verifier) {
-        // These must be provided via AWS SSM or .env for each service
         const userPoolId = process.env.COGNITO_USER_POOL_ID;
         const clientId = process.env.COGNITO_CLIENT_ID;
         const region = process.env.AWS_REGION || "us-east-1";
@@ -19,11 +18,9 @@ const getVerifier = async () => {
         const jwksUrl = `${issuerUrl}/.well-known/jwks.json`;
 
         try {
-            // HIPAA Requirement: Secure Key Fetching with robust timeout
             const response = await axios.get(jwksUrl, { timeout: 30000 });
             const jwks = response.data;
 
-            // GDPR Requirement: Strict signature verification
             verifier = JwtRsaVerifier.create({
                 issuer: issuerUrl,
                 audience: clientId,
@@ -41,23 +38,44 @@ const getVerifier = async () => {
 };
 
 export const authMiddleware = async (req: Request, res: Response, next: NextFunction) => {
+    // 1. Allow OPTIONS requests for local CORS
+    if (req.method === 'OPTIONS') return next();
+
+    // 🟢 FIX: Define token OUTSIDE the try block so 'catch' can see it
+    let token = "";
+
     try {
         const authHeader = req.headers.authorization;
         if (!authHeader?.startsWith('Bearer ')) {
-            return res.status(401).json({ error: "Access Denied: No Token" });
+            return res.status(401).json({ error: "No Authorization Header found" });
         }
 
-        const token = authHeader.split(' ')[1];
+        // 🟢 Assign value to the outer variable
+        token = authHeader.split(' ')[1];
+        
         const v = await getVerifier();
-
-        // This is where HIPAA/GDPR 'Identity Verification' happens
         const payload = await v.verify(token);
 
-        // Attach user to request for role-based access control (RBAC)
-        (req as any).user = payload;
-        next();
+        const groups = payload["cognito:groups"] || [];
+        const rawRole = groups.length > 0 ? groups[0].toLowerCase() : 'patient';
+
+        (req as any).user = {
+            id: payload.sub,
+            email: payload.email,
+            role: (rawRole === 'provider' || rawRole === 'doctor') ? 'doctor' : 'patient'
+        };
+
+        return next();
     } catch (err: any) {
-        console.error("❌ Unauthorized Access Attempt:", err.message);
-        return res.status(401).json({ error: "Access Denied: Invalid Session" });
+        console.error("JWT Error:", err.message);
+        
+        // 🟢 DEBUGGING: Now this will work because 'token' is available
+        return res.status(401).json({ 
+            error: "AUTH_DEBUG_FAIL", 
+            details: err.message,
+            received_token_preview: token ? (token.substring(0, 10) + "...") : "NO_TOKEN",
+            server_client_id: process.env.COGNITO_CLIENT_ID, 
+            server_pool_id: process.env.COGNITO_USER_POOL_ID
+        });
     }
 };
