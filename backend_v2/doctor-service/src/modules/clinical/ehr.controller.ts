@@ -123,17 +123,26 @@ export const handleEhrAction = async (req: Request, res: Response) => {
                 const { note, title, fileName } = req.body;
                 const noteId = uuidv4();
 
-                // 🟢 HL7 FHIR-NATIVE RESOURCE: ClinicalImpression
+                // 🟢 ADVANCED FHIR R4: ClinicalImpression (Now matches your professional blueprint)
                 const fhirResource = {
                     resourceType: "ClinicalImpression",
                     id: noteId,
                     status: "completed",
-                    subject: { reference: `Patient/${patientId}` }, // FHIR Reference
-                    assessor: { reference: `Practitioner/${authUser.sub}` }, // FHIR Reference
+                    code: {
+                        coding: [
+                            {
+                                system: "http://loinc.org",
+                                code: "11450-4",
+                                display: "Problem list - Reported"
+                            }
+                        ],
+                        text: title || "General Clinical Note"
+                    },
+                    subject: { reference: `Patient/${patientId}` },
+                    assessor: { reference: `Practitioner/${authUser.sub}` },
                     date: new Date().toISOString(),
                     summary: note,
                     description: fileName || title || "Clinical Consultation",
-                    // 🛡️ HIPAA/GDPR Metadata
                     meta: {
                         versionId: "1",
                         lastUpdated: new Date().toISOString(),
@@ -146,15 +155,17 @@ export const handleEhrAction = async (req: Request, res: Response) => {
                     }
                 };
 
-                // 🟢 BACKEND REFACTOR: Store Root Keys + FHIR Resource
+                // 🏗️ STAYING ON AWS: Using docClient and PutCommand
                 await docClient.send(new PutCommand({
                     TableName: TABLE_EHR,
                     Item: {
-                        patientId,
-                        recordId: noteId,
-                        type: 'NOTE', // Root key for Indexing using On-the-fly migration
-                        isLocked: true, // 🟢 IMMUTABILITY ENFORCED
-                        resource: fhirResource, // 🟢 RAW FHIR JSON MAP
+                        patientId,           // Root Key
+                        recordId: noteId,    // Range Key
+                        type: 'NOTE',
+                        summary: note,       // Legacy field for Frontend
+                        title: title || "Clinical Note",
+                        isLocked: true,      // HIPAA Immutability
+                        resource: fhirResource, // Advanced FHIR JSON
                         createdAt: new Date().toISOString()
                     }
                 }));
