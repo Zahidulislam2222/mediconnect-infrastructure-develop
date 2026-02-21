@@ -142,10 +142,9 @@ async function loadSecrets() {
         });
         console.log("✅ AWS Vault Sync Complete.");
     } catch (e: any) {
-    console.error("RAW AWS ERROR:", e); // <--- Add this temporarily
-    safeError(`❌ FATAL: Vault Sync Failed. System cannot start securely.`, e.message);
-    process.exit(1); 
-}
+        safeError(`❌ FATAL: Vault Sync Failed. System cannot start securely.`, e.message);
+        process.exit(1); 
+    }
 }
 
 // --- 5. START SERVER ---

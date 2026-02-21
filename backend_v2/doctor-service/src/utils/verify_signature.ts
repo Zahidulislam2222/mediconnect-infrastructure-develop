@@ -67,7 +67,7 @@ async function runPerfectAudit(prescriptionId: string, region: string = "us-east
                 item.patientId, 
                 "INTEGRITY_VERIFICATION_SUCCESS", 
                 `Verified clinical signature for Rx: ${prescriptionId}`,
-                { region }
+                { region, ipAddress: "127.0.0.1" }
             );
         } else {
             console.error("🚨 [SECURITY ALERT]: Signature is INVALID. Data may have been tampered with.");
@@ -81,7 +81,7 @@ async function runPerfectAudit(prescriptionId: string, region: string = "us-east
             item.patientId || "UNKNOWN", 
             "INTEGRITY_VERIFICATION_FAILURE", 
             `Verification failed for Rx: ${prescriptionId}. Error: ${e.message}`,
-            { region }
+            { region, ipAddress: "127.0.0.1" }
         );
     }
 }

@@ -37,7 +37,7 @@ export const getUploadUrl = async (req: Request, res: Response) => {
     // 🟢 HIPAA SECURITY FIX: IDOR Prevention
     const isDoctor = authUser['cognito:groups']?.some((g: string) => ['doctor', 'doctors'].includes(g.toLowerCase()));
     if (authUser.sub !== patientId && !isDoctor) {
-        await writeAuditLog(authUser.sub, patientId, "UNAUTHORIZED_UPLOAD_ATTEMPT", "Blocked attempt to upload to another patient's folder");
+        await writeAuditLog(authUser.sub, patientId, "UNAUTHORIZED_UPLOAD_ATTEMPT", "Blocked attempt to upload", { region: userRegion, ipAddress: req.ip });
         return res.status(403).json({ error: "HIPAA Violation: Unauthorized upload attempt." });
     }
 
@@ -51,7 +51,7 @@ export const getUploadUrl = async (req: Request, res: Response) => {
         });
         const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 300 });
 
-        await writeAuditLog(authUser.sub, patientId, "REQUEST_UPLOAD_URL", `File: ${fileName}`);
+        await writeAuditLog(authUser.sub, patientId, "REQUEST_UPLOAD_URL", `File: ${fileName}`, { region: userRegion, ipAddress: req.ip });
         res.json({ uploadUrl, s3Key });
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -74,7 +74,7 @@ export const getViewUrl = async (req: Request, res: Response) => {
     const isDoctor = authUser['cognito:groups']?.some((g: string) => ['doctor', 'doctors'].includes(g.toLowerCase()));
     
     if (authUser.sub !== targetPatientId && !isDoctor) {
-        await writeAuditLog(authUser.sub, targetPatientId, "UNAUTHORIZED_VIEW_ATTEMPT", "Blocked attempt to view another patient's file");
+        await writeAuditLog(authUser.sub, targetPatientId, "UNAUTHORIZED_VIEW_ATTEMPT", "Blocked attempt to view file", { region: userRegion, ipAddress: req.ip });
         return res.status(403).json({ error: "HIPAA Violation: Unauthorized view attempt." });
     }
 
@@ -85,7 +85,7 @@ export const getViewUrl = async (req: Request, res: Response) => {
         });
         const viewUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
 
-        await writeAuditLog(authUser.sub, targetPatientId, "GET_VIEW_URL", `Key: ${s3Key}`);
+        await writeAuditLog(authUser.sub, targetPatientId, "GET_VIEW_URL", `Key: ${s3Key}`, { region: userRegion, ipAddress: req.ip });
         res.json({ viewUrl });
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -119,7 +119,7 @@ export const handleEhrAction = async (req: Request, res: Response) => {
     const isOwner = authUser.sub === patientId;
 
     if (!isDoctor && !isOwner) {
-        await writeAuditLog(authUser.sub, patientId, "UNAUTHORIZED_EHR_ACCESS", "Blocked attempt to access EHR");
+        await writeAuditLog(authUser.sub, patientId, "UNAUTHORIZED_EHR_ACCESS", "Blocked access", { region: userRegion, ipAddress: req.ip });
         return res.status(403).json({ error: "Access Denied" });
     }
 
@@ -146,7 +146,7 @@ export const handleEhrAction = async (req: Request, res: Response) => {
                     } catch (e) { return { ...item, error: "Link expired" }; }
                 }));
 
-                await writeAuditLog(authUser.sub, patientId, "ACCESS_LIST", `Viewed ${items.length} records`);
+                await writeAuditLog(authUser.sub, patientId, "ACCESS_LIST", `Viewed ${items.length} records`, { region: userRegion, ipAddress: req.ip });
                 return res.json(processedItems);
 
             case "add_clinical_note":
@@ -180,7 +180,7 @@ export const handleEhrAction = async (req: Request, res: Response) => {
                     }
                 }));
 
-                await writeAuditLog(authUser.sub, patientId, "CREATE_FHIR_RESOURCE", `Resource: ClinicalImpression/${noteId}`);
+                await writeAuditLog(authUser.sub, patientId, "CREATE_FHIR_RESOURCE", `Resource: ClinicalImpression/${noteId}`, { region: userRegion, ipAddress: req.ip });
                 return res.json({ success: true, fhirId: noteId });
 
             case "save_record_metadata":
@@ -212,7 +212,7 @@ export const handleEhrAction = async (req: Request, res: Response) => {
                     }
                 }));
 
-                await writeAuditLog(authUser.sub, patientId, "UPLOAD_FILE", `File: ${fName} saved as DocumentReference`);
+                await writeAuditLog(authUser.sub, patientId, "UPLOAD_FILE", `File: ${fName} saved`, { region: userRegion, ipAddress: req.ip });
                 return res.json({ success: true, recordId });
 
             // 🟢 GDPR FIX: Right to Erasure (Soft Delete)
@@ -234,7 +234,7 @@ export const handleEhrAction = async (req: Request, res: Response) => {
                     }
                 }));
 
-                await writeAuditLog(authUser.sub, patientId, "DELETE_RECORD", `Soft deleted record ${recordIdToDelete} (GDPR/HIPAA Retention)`);
+                await writeAuditLog(authUser.sub, patientId, "DELETE_RECORD", `Soft deleted record ${recordIdToDelete}`, { region: userRegion, ipAddress: req.ip });
                 return res.json({ success: true, message: "Record removed from view." });
 
             case "request_upload":

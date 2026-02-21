@@ -69,7 +69,7 @@ export const createPrescription = async (req: Request, res: Response) => {
         const prescriptionId = uuidv4();
         const timestamp = new Date().toISOString();
         const rxData = { prescriptionId, patientName, doctorName, medication, dosage, instructions, timestamp, price: realPrice, refillsRemaining: Number(req.body.refills) || 2, paymentStatus: "UNPAID" };
-        const { pdfUrl, signature } = await pdfGen.generatePrescriptionPDF(rxData);
+        const { pdfUrl, signature } = await pdfGen.generatePrescriptionPDF(rxData, userRegion);
         const fhirResource = { resourceType: "MedicationRequest", id: prescriptionId, status: "active", medicationCodeableConcept: { coding: [{ system: "http://www.nlm.nih.gov/research/umls/rxnorm", code: medication, display: medicationRaw }] }, subject: { reference: `Patient/${patientId}` }, requester: { reference: `Practitioner/${doctorId}` }, authoredOn: timestamp };
 
         // 🟢 ATOMIC TRANSACTION: Solves Data Integrity Violation
@@ -80,6 +80,11 @@ export const createPrescription = async (req: Request, res: Response) => {
                 { Put: { TableName: TABLE_GRAPH, Item: { PK: `PATIENT#${patientId}`, SK: `DRUG#${medication}`, relationship: "takesMedication", lastInteraction: timestamp } } }
             ]
         }));
+
+        await writeAuditLog(authUser.sub, patientId, "ISSUE_PRESCRIPTION", `Medication: ${medication}, ID: ${prescriptionId}`, { 
+            region: userRegion, 
+            ipAddress: req.ip 
+        });
 
         res.json({ message: "Prescription Issued", prescriptionId, downloadUrl: pdfUrl });
     } catch (error: any) { res.status(500).json({ error: error.message }); }
@@ -121,7 +126,7 @@ export const requestRefill = async (req: Request, res: Response) => {
                     { Put: { TableName: TABLE_TRANSACTION, Item: { billId: uuidv4(), referenceId: prescriptionId, patientId: rx.patientId, amount: rx.price, status: "PENDING", createdAt: new Date().toISOString() } } }
                 ]
             }));
-            await writeAuditLog(authUser.sub, patientId, "REQUEST_REFILL", `Refill for ${prescriptionId} processed`);
+            await writeAuditLog(authUser.sub, rx.patientId, "REQUEST_REFILL", `Refill for ${prescriptionId} processed`, { region: extractRegion(req), ipAddress: req.ip });
             return res.json({ message: "Refill authorized" });
         }
         res.status(400).json({ error: "No refills remaining" });
@@ -157,7 +162,7 @@ export const generateQR = async (req: Request, res: Response) => {
         }));
 
         res.json({ qrPayload: `PICKUP-${prescriptionId}` });
-        await writeAuditLog(authUser.sub, rx.Item?.patientId, "GENERATE_QR", `Pickup code generated for ${prescriptionId}`);
+        await writeAuditLog(authUser.sub, rx.Item?.patientId, "GENERATE_QR", `Pickup code generated for ${prescriptionId}`, { region: extractRegion(req), ipAddress: req.ip });
 
     } catch (e: any) {
         console.error("QR Generation Error:", e);
@@ -184,7 +189,7 @@ export const updatePrescription = async (req: Request, res: Response) => {
             ExpressionAttributeValues: { ":status": status, ":time": new Date().toISOString() }
         }));
 
-        await writeAuditLog(authUser.sub, realPatientId, "UPDATE_STATUS", `Status set to ${status} for ${prescriptionId}`);
+        await writeAuditLog(authUser.sub, realPatientId, "UPDATE_STATUS", `Status set to ${status} for ${prescriptionId}`, { region: extractRegion(req), ipAddress: req.ip });
         res.json({ message: `Prescription updated to ${status}` });
     } catch (error: any) { res.status(500).json({ error: error.message }); }
 };

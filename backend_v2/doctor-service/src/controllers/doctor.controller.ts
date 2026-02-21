@@ -8,7 +8,7 @@ import { getRegionalClient } from '../config/aws';
 import { writeAuditLog } from '../../../shared/audit';
 import jwt from 'jsonwebtoken';
 
-const TABLE_DOCTORS = "mediconnect-doctors";
+const TABLE_DOCTORS = process.env.DYNAMO_TABLE || "mediconnect-doctors";
 
 const credentials = {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
@@ -81,8 +81,10 @@ export const createDoctor = catchAsync(async (req: Request, res: Response) => {
         throw e;
     }
 
-    await writeAuditLog(finalId, finalId, "CREATE_DOCTOR", "Doctor profile created");
-    res.status(201).json({ message: 'Doctor profile created successfully', doctor: item });
+    await writeAuditLog(finalId, finalId, "CREATE_DOCTOR", "Doctor profile created", { 
+    region: extractRegion(req), 
+    ipAddress: req.ip 
+});
 });
 
 export const getDoctor = catchAsync(async (req: Request, res: Response) => {
@@ -107,8 +109,10 @@ export const getDoctor = catchAsync(async (req: Request, res: Response) => {
         doctor.avatar = await generatePresignedUrl(bucket, doctor.avatar);
     }
 
-    await writeAuditLog((req as any).user?.sub || "SYSTEM", String(id), "READ_DOCTOR", "Profile viewed");
-    res.status(200).json(doctor);
+    await writeAuditLog((req as any).user?.sub || "SYSTEM", String(id), "READ_DOCTOR", "Profile viewed", { 
+    region: region, 
+    ipAddress: req.ip 
+});
 });
 
 export const updateDoctor = catchAsync(async (req: Request, res: Response) => {
@@ -161,8 +165,10 @@ export const updateDoctor = catchAsync(async (req: Request, res: Response) => {
         ReturnValues: "ALL_NEW"
     }));
 
-    await writeAuditLog(authUser.sub, id, "UPDATE_DOCTOR", "Profile updated");
-    res.status(200).json({ message: 'Profile updated successfully', doctor: response.Attributes });
+    await writeAuditLog(authUser.sub, id, "UPDATE_DOCTOR", "Profile updated", { 
+    region: extractRegion(req), 
+    ipAddress: req.ip 
+});
 });
 
 export const getDoctors = catchAsync(async (req: Request, res: Response) => {
@@ -374,6 +380,8 @@ export const deleteDoctor = catchAsync(async (req: Request, res: Response) => {
         ExpressionAttributeValues: { ":deleted": "ANONYMIZED_GDPR", ":status": "DELETED", ":empty": {} }
     }));
 
-    await writeAuditLog(authUser.sub, id, "DELETE_PROFILE", "Account anonymized per GDPR Right to be Forgotten");
-    res.status(200).json({ message: "Profile successfully anonymized." });
+    await writeAuditLog(authUser.sub, id, "DELETE_PROFILE", "Account anonymized per GDPR Right to be Forgotten", { 
+    region: extractRegion(req), 
+    ipAddress: req.ip 
+});
 });

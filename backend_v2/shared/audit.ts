@@ -59,6 +59,7 @@ export const writeAuditLog = async (
             patientId: patientId || "UNKNOWN",
             action,
             details,
+            ipAddress: metadata?.ipAddress || "0.0.0.0",
             metadata: metadata || {},
             resource: fhirAuditEvent, // FHIR Interoperability
             region: targetRegion      // Data Residency Proof

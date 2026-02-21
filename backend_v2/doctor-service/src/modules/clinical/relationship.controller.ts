@@ -34,7 +34,7 @@ export const getRelationships = async (req: Request, res: Response) => {
         // 🟢 SECURITY CHECK: IDOR Prevention
         const isSearchingOwnSelf = entityId === `PATIENT#${authUser.sub}`;
         if (!isDoctor && !isSearchingOwnSelf) {
-            await writeAuditLog(authUser.sub, entityId, "UNAUTHORIZED_GRAPH_ACCESS", "Blocked attempt to view another user's care network");
+            await writeAuditLog(authUser.sub, entityId, "UNAUTHORIZED_GRAPH_ACCESS", "Blocked attempt to view care network", { region: userRegion, ipAddress: req.ip });
             return res.status(403).json({ error: "Access Denied: You can only view your own care network." });
         }
 
@@ -84,7 +84,8 @@ export const getRelationships = async (req: Request, res: Response) => {
             authUser.sub, 
             logTargetId, 
             "ACCESS_CARE_TEAM", 
-            `Viewed ${rawItems.length} members in Care Team`
+            `Viewed ${rawItems.length} members in Care Team`,
+            { region: userRegion, ipAddress: req.ip }
         );
 
         res.json({

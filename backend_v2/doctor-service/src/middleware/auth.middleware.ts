@@ -3,6 +3,7 @@ import { JwtRsaVerifier } from "aws-jwt-verify";
 import axios from "axios";
 // 🟢 ARCHITECTURE FIX: Import the Multi-Region Config Bridge
 import { COGNITO_CONFIG } from '../config/aws';
+import { writeAuditLog } from '../../../shared/audit';
 
 // 🟢 GDPR FIX: Regional Cache Map (Instead of a single global variable)
 // This ensures US tokens verify against US keys, and EU tokens against EU keys.
@@ -75,6 +76,19 @@ export const authMiddleware = async (req: Request, res: Response, next: NextFunc
         
         // Verify Token (Crypto Check)
         const payload = await v.verify(token);
+
+        // 🟢 2026 SECURITY ENFORCEMENT: Explicit Group Check
+        const groups = payload['cognito:groups'] || [];
+        const isAuthorizedDoctor = groups.includes('doctor') || groups.includes('doctors');
+
+        if (!isAuthorizedDoctor) {
+            await writeAuditLog(payload.sub, "SYSTEM", "UNAUTHORIZED_ACCESS_DENIED", "User attempted to access doctor-service without being in 'doctor' group", {
+                region: userRegion,
+                ipAddress: req.ip,
+                role: "REJECTED_CLIENT"
+            });
+            return res.status(403).json({ error: "Access Denied: High-security role required." });
+        }
 
         // 🟢 CONTEXT INJECTION: Attach Region and Claims to Request
         // This allows downstream controllers to enforce HIPAA/GDPR rules

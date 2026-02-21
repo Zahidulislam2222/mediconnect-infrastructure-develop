@@ -14,15 +14,16 @@ import { KMSClient } from "@aws-sdk/client-kms";
 export const COGNITO_CONFIG = {
     US: {
         REGION: 'us-east-1',
-        USER_POOL_ID: process.env.COGNITO_USER_POOL_ID_US || process.env.COGNITO_USER_POOL_ID || '',
-        CLIENT_PATIENT: process.env.COGNITO_CLIENT_ID_US_PATIENT || '', 
-        CLIENT_DOCTOR: process.env.COGNITO_CLIENT_ID_US_DOCTOR || process.env.COGNITO_CLIENT_ID || '',
+        // 🟢 FIX: 'get' forces it to read the env AFTER the vault has synced
+        get USER_POOL_ID() { return process.env.COGNITO_USER_POOL_ID_US || process.env.COGNITO_USER_POOL_ID || '' },
+        get CLIENT_PATIENT() { return process.env.COGNITO_CLIENT_ID_US_PATIENT || '' }, 
+        get CLIENT_DOCTOR() { return process.env.COGNITO_CLIENT_ID_US_DOCTOR || process.env.COGNITO_CLIENT_ID || '' },
     },
     EU: {
         REGION: 'eu-central-1',
-        USER_POOL_ID: process.env.COGNITO_USER_POOL_ID_EU || '',
-        CLIENT_PATIENT: process.env.COGNITO_CLIENT_ID_EU_PATIENT || '',
-        CLIENT_DOCTOR: process.env.COGNITO_CLIENT_ID_EU_DOCTOR || '',
+        get USER_POOL_ID() { return process.env.COGNITO_USER_POOL_ID_EU || '' },
+        get CLIENT_PATIENT() { return process.env.COGNITO_CLIENT_ID_EU_PATIENT || '' },
+        get CLIENT_DOCTOR() { return process.env.COGNITO_CLIENT_ID_EU_DOCTOR || '' },
     }
 };
 

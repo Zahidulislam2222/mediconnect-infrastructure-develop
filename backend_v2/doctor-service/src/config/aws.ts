@@ -72,26 +72,39 @@ export const COGNITO_CONFIG: any = {
 // Secret Cache logic remains unchanged
 const secretCache: Record<string, string> = {};
 
-export const getSSMParameter = async (path: string, isSecure: boolean = false): Promise<string | undefined> => {
-    // 🟢 REACTIVE FIX: Check memory cache first
-    const envMap: Record<string, string | undefined> = {
-        '/mediconnect/prod/kms/signing_key_id': process.env.KMS_KEY_ID,
-        '/mediconnect/prod/cognito/client_id': COGNITO_CONFIG.US.CLIENT_DOCTOR,
-        '/mediconnect/prod/cognito/user_pool_id': COGNITO_CONFIG.US.USER_POOL_ID,
-        '/mediconnect/prod/cognito/user_pool_id_eu': COGNITO_CONFIG.EU.USER_POOL_ID
-    };
+// --- 🟢 FINAL ARCHITECTURAL FIX: Region-Aware Parameter Loader ---
 
-    if (envMap[path]) return envMap[path];
-    if (secretCache[path]) return secretCache[path];
+export const getSSMParameter = async (
+    path: string, 
+    region: string = "us-east-1", 
+    isSecure: boolean = true
+): Promise<string | undefined> => {
+
+    // 1. Check Regional Memory Cache (Prevents API Throttling & AWS Costs)
+    const cacheKey = `${region}:${path}`;
+    if (secretCache[cacheKey]) return secretCache[cacheKey];
 
     try {
-        const command = new GetParameterCommand({ Name: path, WithDecryption: isSecure });
-        const response = await ssmClient.send(command);
+        // 2. 🟢 DYNAMIC FACTORY: Connects to Frankfurt (EU) or Virginia (US)
+        const regionalSsm = getRegionalSSMClient(region);
+        
+        const command = new GetParameterCommand({ 
+            Name: path, 
+            WithDecryption: isSecure 
+        });
+
+        const response = await regionalSsm.send(command);
         const value = response.Parameter?.Value;
-        if (value) secretCache[path] = value;
+
+        if (value) {
+            // Save to memory cache so the next call is instant and free
+            secretCache[cacheKey] = value; 
+        }
+        
         return value;
-    } catch (error) {
-        console.error(`Failed to fetch SSM parameter: ${path}`, error);
+    } catch (error: any) {
+        // 🚨 HIPAA AUDIT: Log the specific failure for security investigations
+        console.error(`❌ [VAULT_ERROR][${region.toUpperCase()}] Access Denied or Missing: ${path}`);
         return undefined;
     }
 };

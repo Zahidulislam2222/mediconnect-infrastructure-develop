@@ -14,6 +14,11 @@ import { writeAuditLog } from "../../../../shared/audit";
 
 const router = Router();
 
+const extractRegion = (req: Request): string => {
+    const rawRegion = req.headers['x-user-region'];
+    return Array.isArray(rawRegion) ? rawRegion[0] : (rawRegion || "us-east-1");
+};
+
 // =============================================================================
 // 1. PRESCRIPTIONS (Frontend & Pharmacy Integration)
 // =============================================================================
@@ -94,7 +99,8 @@ router.post("/predict-health", authMiddleware, async (req: Request, res: Respons
             authUser.sub,
             patientId || "UNKNOWN",
             "AI_RISK_ASSESSMENT",
-            `Generated ${riskCode.toUpperCase()} risk alert via ${modelType || "General"} model`
+            `Generated ${riskCode.toUpperCase()} risk alert via ${modelType || "General"} model`,
+            { region: extractRegion(req), ipAddress: req.ip }
         );
 
         // Return the standardized FHIR resource

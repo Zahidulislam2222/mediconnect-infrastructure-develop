@@ -87,17 +87,24 @@ export class PDFGenerator {
     }
 
     private async signData(data: PrescriptionData, region: string): Promise<string> {
-        if (!this.kmsKeyId) {
-            const keyId = await getSSMParameter("/mediconnect/prod/kms/signing_key_id");
-            if (!keyId) throw new Error("KMS Key ID not configured");
-            this.kmsKeyId = keyId;
+        // 🟢 PROOF AI FIX: We must fetch the key for the TARGET region every time
+        // to prevent "Key Region Mismatch" errors.
+        
+        const parameterPath = "/mediconnect/prod/kms/signing_key_id";
+        
+        // 1. Get the Key ID for the specific region (SSM is regional)
+        // Note: Ensure your getSSMParameter helper accepts a region argument
+        const kmsKeyId = await getSSMParameter(parameterPath, region); 
+        
+        if (!kmsKeyId) {
+            throw new Error(`CRITICAL: KMS Key ID not found in Parameter Store for region: ${region}`);
         }
 
         const kmsClient = getRegionalKMSClient(region);
         const payload = JSON.stringify(data);
         
         const command = new SignCommand({
-            KeyId: this.kmsKeyId,
+            KeyId: kmsKeyId, // 🔒 This is now the verified regional key
             Message: Buffer.from(payload),
             MessageType: "RAW",
             SigningAlgorithm: "RSASSA_PKCS1_V1_5_SHA_256"
