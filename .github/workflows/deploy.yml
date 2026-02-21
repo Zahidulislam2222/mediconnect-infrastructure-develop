@@ -7,16 +7,11 @@ on:
       - 'backend_v2/doctor-service/**'
       - 'backend_v2/shared/**'
 
-permissions:
-  id-token: write # Required for GCP Workload Identity Federation
-  contents: read
-
 env:
   AZURE_CONTAINER_REGISTRY: "zahidmediconnectacr"
   AZURE_RESOURCE_GROUP: "mediconnect-rg"
   GCP_PROJECT_ID: "mediconnect-analytics"
-  GCP_WORKLOAD_IDENTITY_PROVIDER: "projects/123456789/locations/global/workloadIdentityPools/github-pool/providers/github-provider" # You need to set this up in GCP
-  GCP_SERVICE_ACCOUNT: "github-deployer@mediconnect-analytics.iam.gserviceaccount.com"
+  GCP_REPO: "us-central1-docker.pkg.dev/mediconnect-analytics/mediconnect-repo"
 
 jobs:
   # =========================================================
@@ -25,26 +20,36 @@ jobs:
   deploy-azure-us:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: 📥 Checkout Code
         uses: actions/checkout@v4
 
-      - name: Azure Login
+      - name: 🔐 Azure Login
         uses: azure/login@v1
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }} # JSON from `az ad sp create-for-rbac`
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Login to ACR
+      - name: 🔑 Login to Azure Container Registry (ACR)
         run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
 
-      - name: Build and Push Docker Image
+      - name: 🧹 ZERO-ASSUMPTION FIX: Sanitize Build Context
         run: |
-          # We use the script but override the manual login parts
-          chmod +x deploy_doctor_global.sh
-          # Note: We manually run the build/push here to ensure context is correct
-          docker build -t ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }} -f backend_v2/doctor-service/Dockerfile backend_v2
-          docker push ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}
+          echo "Destroying restrictive .dockerignore files that block the Linux runner..."
+          find . -name ".dockerignore" -delete
+          
+          echo "Creating one perfect Master .dockerignore..."
+          echo "node_modules" > .dockerignore
+          echo ".git" >> .dockerignore
+          echo "backend_v2/node_modules" >> .dockerignore
+          echo "backend_v2/doctor-service/node_modules" >> .dockerignore
+          echo "backend_v2/patient-service/node_modules" >> .dockerignore
 
-      - name: Deploy to Azure Container Apps
+      - name: 🐳 Build and Push Docker Image
+        run: |
+          IMAGE_TAG=${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}
+          docker build -t $IMAGE_TAG -f backend_v2/doctor-service/Dockerfile .
+          docker push $IMAGE_TAG
+
+      - name: 🚀 Deploy to Azure Container Apps
         uses: azure/container-apps-deploy-action@v1
         with:
           appSourcePath: ${{ github.workspace }}/backend_v2
@@ -61,22 +66,47 @@ jobs:
   # =========================================================
   deploy-gcp-eu:
     runs-on: ubuntu-latest
-    needs: deploy-azure-us # Optional: Run sequentially or parallel
     steps:
-      - name: Checkout Code
+      - name: 📥 Checkout Code
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
+      - name: 🔐 Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
 
-      - name: Set up Cloud SDK
+      - name: 🛠️ Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Build & Deploy to Cloud Run (EU)
+      - name: 🔑 Configure Docker for GCP Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: 🧹 ZERO-ASSUMPTION FIX: Sanitize Build Context
         run: |
-          chmod +x deploy_gcp.sh
-          # We execute your script, targeting 'eu'
-          ./deploy_gcp.sh eu
+          echo "Destroying restrictive .dockerignore files that block the Linux runner..."
+          find . -name ".dockerignore" -delete
+          
+          echo "Creating one perfect Master .dockerignore..."
+          echo "node_modules" > .dockerignore
+          echo ".git" >> .dockerignore
+          echo "backend_v2/node_modules" >> .dockerignore
+          echo "backend_v2/doctor-service/node_modules" >> .dockerignore
+          echo "backend_v2/patient-service/node_modules" >> .dockerignore
+
+      - name: 🐳 Build and Push Docker Image to GCP
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/doctor-service-eu:${{ github.sha }}
+          docker build -t $IMAGE_TAG -f backend_v2/doctor-service/Dockerfile .
+          docker push $IMAGE_TAG
+
+      - name: 🚀 Deploy to Cloud Run (Europe-West3 / Frankfurt)
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/doctor-service-eu:${{ github.sha }}
+          gcloud run deploy doctor-service-eu \
+            --image $IMAGE_TAG \
+            --project ${{ env.GCP_PROJECT_ID }} \
+            --region europe-west3 \
+            --port 8082 \
+            --platform managed \
+            --allow-unauthenticated \
+            --set-env-vars NODE_ENV=production,PORT=8082
