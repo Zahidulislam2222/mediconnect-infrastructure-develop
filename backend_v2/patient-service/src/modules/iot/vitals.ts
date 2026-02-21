@@ -1,9 +1,7 @@
 import { Request, Response } from "express";
-// 🟢 FIX: Import getRegionalClient to support EU/US data residency
 import { getRegionalClient } from "../../config/aws";
 import { QueryCommand } from "@aws-sdk/lib-dynamodb";
-
-const TABLE_VITALS = process.env.DYNAMO_TABLE_VITALS || "mediconnect-iot-vitals";
+import { writeAuditLog } from "../../../../shared/audit";
 
 export const getVitals = async (req: Request, res: Response) => {
     try {
@@ -13,8 +11,6 @@ export const getVitals = async (req: Request, res: Response) => {
 
         const requesterId = (req as any).user?.id;
         const requesterRole = (req as any).user?.role;
-        
-        // 🟢 GDPR FIX: Identify the user's region from token or header
         const userRegion = (req as any).user?.region || (req.headers['x-user-region'] as string) || "us-east-1";
 
         if (!patientId) return res.status(400).json({ error: "patientId required" });
@@ -23,10 +19,12 @@ export const getVitals = async (req: Request, res: Response) => {
         const isAuthorized = (requesterId === patientId) || (requesterRole === 'doctor' || requesterRole === 'provider');
 
         if (!isAuthorized) {
+            await writeAuditLog(requesterId || "UNKNOWN", patientId, "UNAUTHORIZED_PHI_READ", "Attempted to read vitals without permission", { ipAddress: req.ip });
             return res.status(403).json({ error: "Access Denied: Unauthorized access to patient telemetry." });
         }
 
-        // 🟢 GDPR FIX: Use dynamic regional client instead of hardcoded US client
+        // 🟢 ARCHITECTURE FIX: Dynamic Table Name Evaluation
+        const TABLE_VITALS = process.env.DYNAMO_TABLE_VITALS || "mediconnect-iot-vitals";
         const dynamicDb = getRegionalClient(userRegion);
 
         const response = await dynamicDb.send(new QueryCommand({
@@ -37,7 +35,9 @@ export const getVitals = async (req: Request, res: Response) => {
             Limit: limit
         }));
 
-        // PROFESSIONAL EMPTY STATE HANDLING
+        // 🟢 HIPAA FIX: Immutable Audit Log for viewing Protected Health Information (PHI)
+        await writeAuditLog(requesterId, patientId, "READ_VITALS", `Viewed ${response.Items?.length || 0} recent vitals`, { region: userRegion, ipAddress: req.ip });
+
         if (!response.Items || response.Items.length === 0) {
             return res.status(404).json({
                 message: "No vitals data found for this patient.",
@@ -76,7 +76,7 @@ export const getVitals = async (req: Request, res: Response) => {
             vitals: rawVitals,
             history: response.Items,
             fhirBundle: fhirBundle,
-            region: userRegion // Meta-data for debugging
+            region: userRegion
         });
 
     } catch (err: any) {

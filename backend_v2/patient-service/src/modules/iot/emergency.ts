@@ -2,13 +2,8 @@ import { Request, Response } from "express";
 import { getRegionalClient, getRegionalSNSClient } from "../../config/aws"; 
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
 import { PublishCommand } from "@aws-sdk/client-sns";
+import { writeAuditLog } from "../../../../shared/audit";
 import { v4 as uuidv4 } from "uuid";
-
-const REGION = process.env.AWS_REGION || "us-east-1";
-
-const TABLE_APPOINTMENTS = process.env.DYNAMO_TABLE_APPOINTMENTS || "mediconnect-appointments";
-const SNS_TOPIC_ARN_US = process.env.SNS_TOPIC_ARN_US;
-const SNS_TOPIC_ARN_EU = process.env.SNS_TOPIC_ARN_EU;
 
 /**
  * 🟢 SHARED LOGIC: handleEmergencyDetection
@@ -27,6 +22,10 @@ export const handleEmergencyDetection = async (patientId: string, heartRate: num
 
         const dynamicDb = getRegionalClient(region);
 
+        // 🟢 ARCHITECTURE FIX: Read env vars inside the function so loadSecrets() has time to populate them
+        const TABLE_APPOINTMENTS = process.env.DYNAMO_TABLE_APPOINTMENTS || "mediconnect-appointments";
+        const targetTopic = region.toUpperCase() === 'EU' ? process.env.SNS_TOPIC_ARN_EU : process.env.SNS_TOPIC_ARN_US;
+
         // 1. Create Emergency Record in DynamoDB
         await dynamicDb.send(new PutCommand({
             TableName: TABLE_APPOINTMENTS,
@@ -39,16 +38,15 @@ export const handleEmergencyDetection = async (patientId: string, heartRate: num
                 startTime: now,
                 notes: message,
                 createdAt: now,
+                // FHIR Standard Embedded
                 resource: { resourceType: "Appointment", id: appointmentId, status: "proposed", description: message },
                 region
             }
         }));
 
         // 2. Dispatch AWS SNS (SMS/Email)
-         const regionalSNS = getRegionalSNSClient(region);
-        const targetTopic = region.toUpperCase() === 'EU' ? SNS_TOPIC_ARN_EU : SNS_TOPIC_ARN_US;
-
         if (targetTopic) {
+            const regionalSNS = getRegionalSNSClient(region);
             await regionalSNS.send(new PublishCommand({
                 TopicArn: targetTopic,
                 Message: message,
@@ -58,7 +56,9 @@ export const handleEmergencyDetection = async (patientId: string, heartRate: num
             console.warn(`⚠️ No SNS Topic configured for region: ${region}`);
         }
         
-        console.log(`[AUDIT] Emergency Processed for ${patientId} in ${region}`);
+        // 🟢 HIPAA FIX: Immutable Audit Log for Emergency dispatch
+        await writeAuditLog("SYSTEM_IOT", patientId, "EMERGENCY_DISPATCH", message, { region, heartRate });
+        
         return { success: true, appointmentId };
     }
     return { success: false, message: "Vitals within normal range." };
@@ -72,12 +72,16 @@ export const triggerEmergency = async (req: Request, res: Response) => {
         const { patientId, heartRate, type } = req.body;
         const user = (req as any).user;
         
-        // Security Check
-        if (patientId !== user.id && user.role !== 'doctor') {
+        if (!user || (patientId !== user.id && user.role !== 'doctor')) {
+            await writeAuditLog(user?.id || "UNKNOWN", patientId, "UNAUTHORIZED_EMERGENCY", "Unauthorized panic button trigger.", { ipAddress: req.ip });
             return res.status(403).json({ error: "Unauthorized" });
         }
 
         const result = await handleEmergencyDetection(patientId, Number(heartRate), type || 'MANUAL_OVERRIDE', user.region);
+        
+        // Audit manual trigger
+        await writeAuditLog(user.id, patientId, "MANUAL_EMERGENCY", "Panic button pressed", { region: user.region, ipAddress: req.ip });
+
         return res.status(result.success ? 201 : 200).json(result);
 
     } catch (error: any) {

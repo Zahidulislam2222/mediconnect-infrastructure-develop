@@ -1,17 +1,13 @@
 import { BigQuery } from '@google-cloud/bigquery';
 import { unmarshall } from "@aws-sdk/util-dynamodb";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSSMParameter } from "../../config/aws";
-
-// Initialize S3 for DLQ
-const s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
-const DLQ_BUCKET = process.env.DLQ_BUCKET || "mediconnect-data-lake-dlq";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
+// 🟢 FIX: Use Shared Regional S3 Factory to prevent GDPR leaks
+import { getRegionalS3Client } from "../../config/aws";
 
 let bigquery: BigQuery;
 
 async function getBigQueryClient() {
     if (!bigquery) {
-        // Fetch credentials from SSM if not in Env
         const projectId = process.env.GCP_PROJECT_ID;
         const clientEmail = process.env.GCP_CLIENT_EMAIL;
         const privateKey = process.env.GCP_PRIVATE_KEY;
@@ -27,25 +23,18 @@ async function getBigQueryClient() {
     return bigquery;
 }
 
-const DATASET_ID = "mediconnect_analytics";
-const TABLE_ID = "appointments_stream";
-
 export const analyticsHandler = async (event: any, region: string = "us-east-1") => {
     const rowsToInsert: any[] = [];
     
-    // 🟢 100% GDPR COMPLIANT DATASET ROUTING
+    // 🟢 GDPR COMPLIANT DATASET ROUTING
     const DATASET_ID = region.toUpperCase() === 'EU' ? "mediconnect_analytics_eu" : "mediconnect_analytics";
     const TABLE_ID = "appointments_stream";
 
-    // Parse DynamoDB Stream Records
     if (event.Records) {
         for (const record of event.Records) {
-            // We only care about COMPLETED appointments or new inserts?
-            // User requirement: "Whenever an appointment is marked 'COMPLETED', trigger"
-            // So we check Modify events where status changed to COMPLETED.
             if (record.eventName === 'MODIFY' || record.eventName === 'INSERT') {
-                const newImage = unmarshall(record.dynamodb.NewImage);
-                const oldImage = record.dynamodb.OldImage ? unmarshall(record.dynamodb.OldImage) : {};
+                const newImage = unmarshall(record.dynamodb.NewImage as any);
+                const oldImage = record.dynamodb.OldImage ? unmarshall(record.dynamodb.OldImage as any) : {};
 
                 if (newImage.status === 'COMPLETED' && oldImage.status !== 'COMPLETED') {
                     rowsToInsert.push({
@@ -71,15 +60,19 @@ export const analyticsHandler = async (event: any, region: string = "us-east-1")
     } catch (error: any) {
         console.error("BigQuery Sync Failed. Sending to DLQ...", error);
 
-        // Dead Letter Queue (S3)
+        // 🟢 GDPR FIX: Ensure Dead Letter Queue writes to the correct Legal Jurisdiction
+        const regionalS3 = getRegionalS3Client(region);
+        const DLQ_BUCKET = process.env.DLQ_BUCKET || "mediconnect-data-lake-dlq";
+        const targetBucket = region.toUpperCase() === 'EU' ? `${DLQ_BUCKET}-eu` : DLQ_BUCKET;
         const dlqKey = `failed/${Date.now()}.json`;
-        await s3Client.send(new PutObjectCommand({
-            Bucket: DLQ_BUCKET,
+
+        await regionalS3.send(new PutObjectCommand({
+            Bucket: targetBucket,
             Key: dlqKey,
             Body: JSON.stringify({ error: error.message, rows: rowsToInsert }),
             ContentType: "application/json"
         }));
 
-        return { message: "Failed sync saved to DLQ" };
+        return { message: `Failed sync saved to Regional DLQ: ${targetBucket}` };
     }
 };

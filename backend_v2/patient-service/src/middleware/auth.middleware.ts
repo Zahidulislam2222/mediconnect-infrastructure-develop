@@ -1,96 +1,82 @@
 import { Request, Response, NextFunction } from 'express';
-import { CognitoJwtVerifier } from "aws-jwt-verify";
+import { JwtRsaVerifier } from "aws-jwt-verify";
+import axios from "axios";
+import { COGNITO_CONFIG } from '../config/aws';
 
-/**
- * 🛡️ ARCHITECTURE #2: GLOBAL MULTI-REGION VERIFIER
- * This middleware supports both US and EU Cognito Pools.
- * It implements a "Primary-Secondary" fallback to allow Doctors
- * to cross regions legally while keeping Patients locked to their region.
- */
+const verifiers: Record<string, any> = {};
 
-// 1. Define Verifiers for each Region (Static initialization for performance)
-const verifierUS = CognitoJwtVerifier.create({
-    userPoolId: process.env.COGNITO_USER_POOL_ID_US || "us-east-1_fUslfc7kL",
-    tokenUse: "id", // We use ID tokens for rich profile data (Role/FHIR ID)
-    clientId: process.env.COGNITO_CLIENT_ID_US || "",
-});
+const getVerifier = async (userRegion: string) => {
+    const regionKey = userRegion?.toUpperCase().includes('EU') ? 'EU' : 'US';
+    
+    if (verifiers[regionKey]) return verifiers[regionKey];
 
-const verifierEU = CognitoJwtVerifier.create({
-    userPoolId: process.env.COGNITO_USER_POOL_ID_EU || "eu-central-1_xxxxxxxxx",
-    tokenUse: "id",
-    clientId: process.env.COGNITO_CLIENT_ID_EU || "",
-});
-
-export const authMiddleware = async (req: Request, res: Response, next: NextFunction) => {
-    if (req.method === 'OPTIONS') return next();
-
-    let token = "";
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader?.startsWith('Bearer ')) {
-        return res.status(401).json({ error: "Missing or malformed Authorization header" });
+    const config = COGNITO_CONFIG[regionKey];
+    
+    // 🛡️ SECURITY FIX: Explicit check to prevent empty string bypass
+    if (!config.USER_POOL_ID || !config.CLIENT_PATIENT) {
+        throw new Error(`AUTH_CONFIG_MISSING: Missing Cognito config for ${regionKey}`);
     }
 
-    token = authHeader.split(' ')[1];
-
-    // Detect target region from header (Frontend must send 'US' or 'EU')
-    const userRegion = (req.headers['x-user-region'] as string) || 'US';
+    const issuerUrl = `https://cognito-idp.${config.REGION}.amazonaws.com/${config.USER_POOL_ID}`;
+    const jwksUrl = `${issuerUrl}/.well-known/jwks.json`;
 
     try {
-        // 🧪 ATTEMPT 1: Verify with the user's selected Home Region
-        const primaryVerifier = userRegion.toUpperCase() === 'EU' ? verifierEU : verifierUS;
-        const payload = await primaryVerifier.verify(token);
+        // Axios manual fetch prevents Cloud Run / Azure Container Apps timeout bugs
+        const response = await axios.get(jwksUrl, { timeout: 30000 });
+        const verifier = JwtRsaVerifier.create({
+            issuer: issuerUrl,
+            // 🟢 INTEROPERABILITY FIX: Allow BOTH Patient Tokens AND Doctor Tokens
+            audience: [config.CLIENT_PATIENT, config.CLIENT_DOCTOR].filter(Boolean),
+            tokenUse: "id",
+            jwks: response.data
+        });
 
-        // Map payload to standard req.user object
-        setReqUser(req, payload, userRegion);
-        return next();
-
-    } catch (err: any) {
-        // 🧪 ATTEMPT 2: CROSS-BORDER DOCTOR VISITOR FALLBACK
-        // If the primary region failed, it might be a doctor from the other region
-        try {
-            const secondaryVerifier = userRegion.toUpperCase() === 'EU' ? verifierUS : verifierEU;
-            const payload = await secondaryVerifier.verify(token);
-
-            // 🛑 SECURITY GATE: Only Doctors/Admins can cross borders
-            const groups = payload["cognito:groups"] || [];
-            const isDoctor = groups.some((g: string) => 
-                ['doctor', 'provider', 'admin'].includes(g.toLowerCase())
-            );
-
-            if (!isDoctor) {
-                throw new Error("Patient data residency violation: EU patients cannot be accessed by US patient tokens.");
-            }
-
-            // Success: Validating a "Visiting Doctor"
-            setReqUser(req, payload, userRegion);
-            return next();
-
-        } catch (finalErr: any) {
-            console.error(`[AUTH_FAIL] Region: ${userRegion} | Error: ${finalErr.message}`);
-            return res.status(401).json({
-                error: "Unauthorized",
-                details: "Invalid token for this region or restricted cross-border access.",
-                hint: "Ensure you are targeting the correct region header: x-user-region"
-            });
-        }
+        verifiers[regionKey] = verifier;
+        return verifier;
+    } catch (error: any) {
+        throw new Error(`Failed to initialize JWKS for ${regionKey}`);
     }
 };
 
-/**
- * Helper to normalize Cognito payload into Express Request user
- */
-function setReqUser(req: Request, payload: any, region: string) {
-    const groups = payload["cognito:groups"] || [];
-    const rawRole = groups.length > 0 ? groups[0].toLowerCase() : 'patient';
+export const authMiddleware = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader?.startsWith('Bearer ')) {
+            return res.status(401).json({ error: "Unauthorized: Missing token" });
+        }
 
-    (req as any).user = {
-        id: payload.sub,
-        email: payload.email,
-        // FHIR Compliance: Extract the FHIR ID from the custom attribute we created
-        fhirId: payload["custom:fhir_id"] || payload.sub,
-        // Normalize Role
-        role: (rawRole === 'provider' || rawRole === 'doctor') ? 'doctor' : 'patient',
-        region: region.toUpperCase()
-    };
-}
+        const token = authHeader.split(' ')[1];
+        
+        // Safely parse header array to string
+        const rawRegion = req.headers['x-user-region'];
+        const userRegion = Array.isArray(rawRegion) ? rawRegion[0] : (rawRegion || "us-east-1");
+
+        // Get strict regional verifier
+        const v = await getVerifier(userRegion);
+        const payload = await v.verify(token);
+
+        // 🟢 CONTEXT INJECTION & FHIR MAPPING
+        const groups = payload['cognito:groups'] || [];
+        const isDoctor = groups.includes('doctor') || groups.includes('doctors');
+        const isPatient = groups.includes('patient') || groups.includes('patients');
+
+        if (!isDoctor && !isPatient) {
+            return res.status(403).json({ error: "Access Denied: Unrecognized User Role" });
+        }
+
+        (req as any).user = { 
+            id: payload.sub,
+            email: payload.email,
+            fhirId: payload["custom:fhir_id"] || payload.sub,
+            region: userRegion,
+            isDoctor,
+            isPatient
+        };
+        
+        next();
+
+    } catch (err: any) {
+        console.error("Auth Middleware Blocked Request:", err.message);
+        return res.status(401).json({ error: "Unauthorized: Invalid or expired token" });
+    }
+};

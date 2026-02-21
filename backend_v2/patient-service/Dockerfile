@@ -1,41 +1,42 @@
-# --- STAGE 1: BUILDER (Compiles TS to JS) ---
+# --- STAGE 1: BUILDER ---
 FROM node:20-alpine AS builder
 WORKDIR /app
 
-# 1. Copy Root Files (if any shared configs exist)
-COPY package*.json ./
+# 1. Copy the monorepo package files (Root level)
+COPY backend_v2/package*.json ./
 
-# 2. Copy Shared Folder (CRITICAL for imports)
-COPY shared ./shared
+# 2. Create the service directory and copy its package files
+RUN mkdir -p ./patient-service
+COPY backend_v2/patient-service/package*.json ./patient-service/
 
-# 3. Copy Service Source
-COPY patient-service ./patient-service
-
-# 4. Install Dependencies & Build
-WORKDIR /app/patient-service
+# 3. Install dependencies at the /app level (Resolves shared folder links)
 RUN npm ci
-RUN npm run build 
-# (Result: /app/patient-service/dist/patient-service/src/index.js)
 
-# --- STAGE 2: RUNNER (Production Image) ---
+# 4. Copy the source code
+COPY backend_v2/shared ./shared
+COPY backend_v2/patient-service ./patient-service
+
+# 5. Build
+WORKDIR /app/patient-service
+RUN ../node_modules/.bin/tsc --project tsconfig.json
+
+# 6. 🟢 DOCKER 100% FIX: Prune dev dependencies at the root level!
+WORKDIR /app
+RUN npm prune --omit=dev 
+
+# --- STAGE 2: RUNNER (Production) ---
 FROM node:20-alpine
 WORKDIR /app
-
-# 1. Create Non-Root User
 RUN chown -R node:node /app
 USER node
 
-# 2. Copy Built Artifacts from Builder
-# We copy the entire 'dist' structure to preserve paths
+# 🟢 FIXED PATH: Copy node_modules from the root /app folder
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/patient-service/dist ./dist
 COPY --from=builder --chown=node:node /app/patient-service/package*.json ./
-COPY --from=builder --chown=node:node /app/patient-service/node_modules ./node_modules
 
-# 3. Environment Config
 ENV NODE_ENV=production
 ENV PORT=8081
 EXPOSE 8081
 
-# 4. Start
-CMD ["node", "dist/patient-service/src/index.js"] 
-# (Adjust path based on your actual tsconfig outDir. Usually it's dist/index.js)
+CMD ["node", "dist/patient-service/src/index.js"]

@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { getRegionalClient } from '../config/aws'; 
 import { ScanCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import {
@@ -9,52 +9,50 @@ import {
     verifyIdentity,
     deleteProfile,
     getPatientById,
-    searchPatients
+    searchPatients,
+    extractRegion // Imported from the controller fix
 } from '../controllers/patient.controller';
 import { authMiddleware } from '../middleware/auth.middleware';
 import { writeAuditLog } from '../../../shared/audit';
 
+const router = Router();
+
 // ==========================================
-// 🛡️ PUBLIC HANDLERS
+// 📖 1. PUBLIC ROUTES (No Token Required)
 // ==========================================
 
-export const getPublicKnowledge = async (req: any, res: any) => {
+export const getPublicKnowledge = async (req: Request, res: Response) => {
     try {
-        const tableName = "mediconnect-knowledge-base";
-        const userRegion = req.headers['x-user-region'] || "us-east-1"; // 🟢 Detect Region
-        const dynamicDb = getRegionalClient(userRegion); // 🟢 Use Local DB
+        const userRegion = extractRegion(req);
+        const dynamicDb = getRegionalClient(userRegion);
         
-        const params = { TableName: tableName };
-        const { Items } = await dynamicDb.send(new ScanCommand(params));
-        
+        const { Items } = await dynamicDb.send(new ScanCommand({ TableName: "mediconnect-knowledge-base" }));
         if (!Items || Items.length === 0) return res.json([]);
 
-        // 🟢 FIX: DocumentClient auto-unmarshalls, so we don't need 'unmarshall(item)'
-        const fhirArticles = Items.map((art: any) => {
-            return {
-                id: art.topic || art.id,
-                resourceType: "DocumentReference",
-                description: art.title || "Untitled",
-                content: [{ attachment: { url: art.coverImage } }],
-                legacyData: { category: art.category || "General", content: art.content }
-            };
-        });
+        // 🟢 FHIR: Map public articles to DocumentReference
+        const fhirArticles = Items.map((art: any) => ({
+            id: art.topic || art.id,
+            resourceType: "DocumentReference",
+            description: art.title || "Untitled",
+            content: [{ attachment: { url: art.coverImage } }],
+            legacyData: { category: art.category || "General", content: art.content }
+        }));
         res.json(fhirArticles);
     } catch (error: any) {
-        console.error("DYNAMO_ERROR:", error.message);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: "Knowledge Base Unavailable" });
     }
 };
 
-export const getPublicArticle = async (req: any, res: any) => {
+export const getPublicArticle = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const userRegion = req.headers['x-user-region'] || "us-east-1"; // 🟢 Detect Region
-        const dynamicDb = getRegionalClient(userRegion); // 🟢 Use Local DB
+        const userRegion = extractRegion(req);
+        const dynamicDb = getRegionalClient(userRegion);
 
-        const params = { TableName: "mediconnect-knowledge-base", Key: { topic: id } }; // 🟢 Simplified Key for DocumentClient
-        
-        const { Item: art } = await dynamicDb.send(new GetCommand(params));
+        const { Item: art } = await dynamicDb.send(new GetCommand({ 
+            TableName: "mediconnect-knowledge-base", 
+            Key: { topic: id } 
+        }));
         
         if (!art) return res.status(404).json({ error: "Article not found" });
 
@@ -67,53 +65,49 @@ export const getPublicArticle = async (req: any, res: any) => {
             legacyData: { category: art.category, content: art.content, slug: art.slug }
         };
 
-        const userId = (req as any).user?.id || "GUEST";
-        await writeAuditLog(userId, "PUBLIC", "READ_KB_ITEM", `Read article: ${art.title}`, { articleId: id, region: userRegion });
+        // 🟢 HIPAA: Log IP address even for public guests accessing medical articles
+        await writeAuditLog("GUEST", id, "READ_KB_ITEM", `Read article: ${art.title}`, { 
+            region: userRegion, 
+            ipAddress: req.ip 
+        });
         
         res.json(fhirArticle);
     } catch (error) {
-        console.error("Article Error:", error);
         res.status(500).json({ error: "Content currently unavailable" });
     }
 };
 
-const router = Router();
-
-// ==========================================
-// 1️⃣ PUBLIC ROUTES (Specific First)
-// ==========================================
 router.get('/public/knowledge', getPublicKnowledge);
 router.get('/public/knowledge/:id', getPublicArticle);
-router.get('/stats/demographics', getDemographics);
-router.post('/register-patient', createPatient); // POST is public
-router.post('/', createPatient);
 
 // ==========================================
-// 2️⃣ PASS-THROUGH (For IoT Router)
-// ==========================================
-// 🟢 MUST be before 'authMiddleware' and before '/:id'
-router.get(['/vitals', '/emergency', '/vitals/*', '/emergency/*'], (req, res, next) => {
-    next('router');
-});
-
-// ==========================================
-// 🔒 PROTECTED BOUNDARY
+// 🔒 2. SECURE BOUNDARY (Token Required)
 // ==========================================
 router.use(authMiddleware);
 
 // ==========================================
-// 3️⃣ PROTECTED SPECIFIC ROUTES
+// 🛡️ 3. PROTECTED ROUTES (HIPAA Enforced)
 // ==========================================
-router.get('/search', searchPatients); 
-router.get('/register-patient', getPatientById); 
-router.post('/identity/verify', verifyIdentity);
-router.get('/:userId', getPatientById);
-router.delete('/me', deleteProfile);
 
-// ==========================================
-// 4️⃣ PROTECTED GENERIC / CATCH-ALL
-// ==========================================
+// Dashboards & Analytics
+router.get('/stats/demographics', getDemographics);
+router.get('/search', searchPatients); 
+
+// Registration (Requires Cognito Token)
+router.post('/register-patient', createPatient); 
+router.post('/', createPatient);
+
+// Identity Verification
+router.post('/identity/verify', verifyIdentity);
+
+// Profile Management
+router.get('/register-patient', getProfile); // Load own profile
+router.get('/:userId', getPatientById);
 router.get(['/patients/:id', '/:id'], getProfile);
+
 router.put(['/patients/:id', '/:id'], updateProfile);
+
+// GDPR Right to be Forgotten
+router.delete('/me', deleteProfile);
 
 export default router;

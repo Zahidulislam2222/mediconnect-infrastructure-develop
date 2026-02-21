@@ -1,10 +1,11 @@
-name: "🚀 Global Multi-Cloud Deploy (Doctor Service)"
+name: "🚀 Global Multi-Cloud Deploy (Doctor & Patient)"
 
 on:
   push:
     branches: [ "main" ]
     paths:
       - 'backend_v2/doctor-service/**'
+      - 'backend_v2/patient-service/**'
       - 'backend_v2/shared/**'
 
 env:
@@ -15,22 +16,18 @@ env:
   GCP_SERVICE_ACCOUNT: "data-logger@mediconnect-analytics.iam.gserviceaccount.com"
 
 jobs:
-  deploy-azure-us:
+  # ==========================================
+  # 🩺 DOCTOR SERVICE JOBS
+  # ==========================================
+  deploy-doctor-azure-us:
     runs-on: "ubuntu-latest"
     steps:
-      - name: "📥 Checkout Code"
-        uses: actions/checkout@v4
-      
-      - name: "🔐 Azure Login"
-        uses: azure/login@v1
+      - uses: actions/checkout@v4
+      - uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-      
-      - name: "🔑 Login to ACR"
-        run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
-      
-      - name: "🧹 Sanitize Build Context"
-        run: find . -name ".dockerignore" -delete
+      - run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
+      - run: find . -name ".dockerignore" -delete
       
       - name: "🐳 Build and Push to Azure"
         run: |
@@ -39,7 +36,6 @@ jobs:
           docker push $IMAGE_TAG
 
       - name: "🔐 Push Secrets to Azure"
-        # 🟢 AZURE FIX: Use CLI to create secrets because the Action doesn't support creating them on the fly
         run: |
           az containerapp secret set \
             --name doctor-service \
@@ -53,28 +49,18 @@ jobs:
           containerAppName: "doctor-service"
           resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
           imageToDeploy: "${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}"
-          # 🟢 Secrets are now referenced securely from the step above
           environmentVariables: "NODE_ENV=production AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=secretref:aws-access-key-id AWS_SECRET_ACCESS_KEY=secretref:aws-secret-access-key"
 
-  deploy-gcp-eu:
+  deploy-doctor-gcp-eu:
     runs-on: "ubuntu-latest"
     steps:
-      - name: "📥 Checkout Code"
-        uses: actions/checkout@v4
-        
-      - name: "🔐 GCP Login"
-        uses: google-github-actions/auth@v2
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_CREDENTIALS }}
-          
-      - name: "🛠️ Setup Cloud SDK"
-        uses: google-github-actions/setup-gcloud@v2
-        
-      - name: "🔑 Auth Docker"
-        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
-        
-      - name: "🧹 Sanitize Build Context"
-        run: find . -name ".dockerignore" -delete
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+      - run: find . -name ".dockerignore" -delete
         
       - name: "🐳 Build and Push to GCP"
         run: |
@@ -82,26 +68,79 @@ jobs:
           docker build -t $IMAGE_TAG -f backend_v2/doctor-service/Dockerfile .
           docker push $IMAGE_TAG
 
-      - name: "🛠️ Enable Secret Manager API"
-        run: gcloud services enable secretmanager.googleapis.com
-          
-      - name: "🔒 Inject GCP Secrets (HIPAA Compliance)"
-        # 🟢 HIPAA 100% FIX: Pushes keys into GCP Secret Manager securely, then grants the container access.
-        run: |
-          echo -n "${{ secrets.AWS_ACCESS_KEY_ID }}" | gcloud secrets create aws_access_key_id --data-file=- || echo -n "${{ secrets.AWS_ACCESS_KEY_ID }}" | gcloud secrets versions add aws_access_key_id --data-file=-
-          echo -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" | gcloud secrets create aws_secret_access_key --data-file=- || echo -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" | gcloud secrets versions add aws_secret_access_key --data-file=-
-          gcloud secrets add-iam-policy-binding aws_access_key_id --member="serviceAccount:${{ env.GCP_SERVICE_ACCOUNT }}" --role="roles/secretmanager.secretAccessor"
-          gcloud secrets add-iam-policy-binding aws_secret_access_key --member="serviceAccount:${{ env.GCP_SERVICE_ACCOUNT }}" --role="roles/secretmanager.secretAccessor"
-
       - name: "🚀 Deploy GCP Cloud Run"
         run: |
           IMAGE_TAG=${{ env.GCP_REPO }}/doctor-service-eu:${{ github.sha }}
-          # 🟢 Uses --update-secrets to mount them securely from the Vault instead of plaintext!
           gcloud run deploy doctor-service-eu \
             --image "$IMAGE_TAG" \
             --project ${{ env.GCP_PROJECT_ID }} \
             --region europe-west3 \
             --port 8082 \
+            --platform managed \
+            --service-account ${{ env.GCP_SERVICE_ACCOUNT }} \
+            --set-env-vars "NODE_ENV=production,AWS_REGION=eu-central-1" \
+            --update-secrets "AWS_ACCESS_KEY_ID=aws_access_key_id:latest,AWS_SECRET_ACCESS_KEY=aws_secret_access_key:latest"
+
+  # ==========================================
+  # 🛌 PATIENT SERVICE JOBS (GCP ONLY)
+  # ==========================================
+  deploy-patient-gcp-us:
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+      - run: find . -name ".dockerignore" -delete
+        
+      - name: "🐳 Build and Push Patient US to GCP"
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/patient-service-us:${{ github.sha }}
+          docker build -t $IMAGE_TAG -f backend_v2/patient-service/Dockerfile .
+          docker push $IMAGE_TAG
+
+      - name: "🚀 Deploy GCP Cloud Run (Patient US)"
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/patient-service-us:${{ github.sha }}
+          # 🟢 Deploys to US Region (us-central1), using Port 8081
+          gcloud run deploy patient-service-us \
+            --image "$IMAGE_TAG" \
+            --project ${{ env.GCP_PROJECT_ID }} \
+            --region us-central1 \
+            --port 8081 \
+            --platform managed \
+            --service-account ${{ env.GCP_SERVICE_ACCOUNT }} \
+            --set-env-vars "NODE_ENV=production,AWS_REGION=us-east-1" \
+            --update-secrets "AWS_ACCESS_KEY_ID=aws_access_key_id:latest,AWS_SECRET_ACCESS_KEY=aws_secret_access_key:latest"
+
+  deploy-patient-gcp-eu:
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+      - run: find . -name ".dockerignore" -delete
+        
+      - name: "🐳 Build and Push Patient EU to GCP"
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/patient-service-eu:${{ github.sha }}
+          docker build -t $IMAGE_TAG -f backend_v2/patient-service/Dockerfile .
+          docker push $IMAGE_TAG
+
+      - name: "🚀 Deploy GCP Cloud Run (Patient EU)"
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/patient-service-eu:${{ github.sha }}
+          # 🟢 GDPR: Deploys strictly to EU Region (europe-west3), using Port 8081
+          gcloud run deploy patient-service-eu \
+            --image "$IMAGE_TAG" \
+            --project ${{ env.GCP_PROJECT_ID }} \
+            --region europe-west3 \
+            --port 8081 \
             --platform managed \
             --service-account ${{ env.GCP_SERVICE_ACCOUNT }} \
             --set-env-vars "NODE_ENV=production,AWS_REGION=eu-central-1" \
