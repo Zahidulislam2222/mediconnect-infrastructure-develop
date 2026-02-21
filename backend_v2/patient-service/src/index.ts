@@ -81,7 +81,7 @@ app.use(morgan((tokens, req, res) => {
 }, { skip: (req) => req.url === '/health' || req.method === 'OPTIONS' }));
 
 
-// --- 3. 100% COMPLIANT VAULT SYNC (BATCHED) ---
+// --- 3. 100% COMPLIANT VAULT SYNC (BATCHED & EXPLICIT) ---
 async function loadSecrets() {
     const region = process.env.AWS_REGION || 'us-east-1';
     const ssm = getRegionalSSMClient(region);
@@ -89,7 +89,7 @@ async function loadSecrets() {
     try {
         console.log(`🔐 Synchronizing secrets with AWS Vault [${region}]...`);
 
-        // 🟢 BATCH 1: INFRASTRUCTURE (5 items)
+        // Batch 1: Infrastructure
         const cmdInfra = new GetParametersCommand({
             Names: [
                 '/mediconnect/prod/db/dynamo_table',
@@ -101,12 +101,14 @@ async function loadSecrets() {
             WithDecryption: true
         });
 
-        // 🟢 BATCH 2: IDENTITY (6 items)
+        // Batch 2: Identity (Explicit + Local)
         const cmdIdentity = new GetParametersCommand({
             Names: [
                 '/mediconnect/prod/cognito/user_pool_id',
                 '/mediconnect/prod/cognito/client_id_patient',
                 '/mediconnect/prod/cognito/client_id_doctor',
+                '/mediconnect/prod/cognito/client_id_us_patient',
+                '/mediconnect/prod/cognito/client_id_us_doctor',
                 '/mediconnect/prod/cognito/user_pool_id_eu',
                 '/mediconnect/prod/cognito/client_id_eu_patient',
                 '/mediconnect/prod/cognito/client_id_eu_doctor'
@@ -114,7 +116,6 @@ async function loadSecrets() {
             WithDecryption: true
         });
 
-        // Execute in parallel
         const [infraRes, identityRes] = await Promise.all([
             ssm.send(cmdInfra),
             ssm.send(cmdIdentity)
@@ -134,13 +135,21 @@ async function loadSecrets() {
             if (p.Name.includes('topic_arn_eu')) process.env.SNS_TOPIC_ARN_EU = p.Value;
             
             if (p.Name.endsWith('/cognito/user_pool_id')) process.env.COGNITO_USER_POOL_ID_US = p.Value;
-            if (p.Name.endsWith('/client_id_patient')) process.env.COGNITO_CLIENT_ID_US_PATIENT = p.Value;
-            if (p.Name.endsWith('/client_id_doctor')) process.env.COGNITO_CLIENT_ID_US_DOCTOR = p.Value;
-            
+            if (p.Name.endsWith('/client_id_patient')) process.env.COGNITO_CLIENT_ID = p.Value; 
+            if (p.Name.endsWith('/client_id_doctor')) process.env.COGNITO_CLIENT_ID_DOCTOR_LOCAL = p.Value; 
+
+            if (p.Name.endsWith('/client_id_us_patient')) process.env.COGNITO_CLIENT_ID_US_PATIENT = p.Value;
+            if (p.Name.endsWith('/client_id_us_doctor')) process.env.COGNITO_CLIENT_ID_US_DOCTOR = p.Value;
+
             if (p.Name.includes('user_pool_id_eu')) process.env.COGNITO_USER_POOL_ID_EU = p.Value;
             if (p.Name.includes('client_id_eu_patient')) process.env.COGNITO_CLIENT_ID_EU_PATIENT = p.Value;
             if (p.Name.includes('client_id_eu_doctor')) process.env.COGNITO_CLIENT_ID_EU_DOCTOR = p.Value;
         });
+
+        // Local Fallbacks
+        if (!process.env.COGNITO_CLIENT_ID_US_PATIENT) process.env.COGNITO_CLIENT_ID_US_PATIENT = process.env.COGNITO_CLIENT_ID;
+        if (!process.env.COGNITO_CLIENT_ID_US_DOCTOR) process.env.COGNITO_CLIENT_ID_US_DOCTOR = process.env.COGNITO_CLIENT_ID_DOCTOR_LOCAL;
+
         console.log("✅ AWS Vault Sync Complete.");
     } catch (e: any) {
         safeError(`❌ FATAL: Vault Sync Failed. System cannot start securely.`, e.message);
@@ -150,35 +159,49 @@ async function loadSecrets() {
 
 // --- 4. IOT BRIDGE ---
 const startIoTBridge = () => {
-    if (!process.env.MQTT_BROKER_URL) return;
+    if (!process.env.MQTT_BROKER_URL) {
+        console.warn("⚠️ MQTT Bridge Skipped: No Broker URL Found");
+        return;
+    }
 
-    const mqttClient = connect(process.env.MQTT_BROKER_URL);
-    mqttClient.on('connect', () => {
-        console.log("📡 Connected to AWS IoT Secure Broker");
-        mqttClient.subscribe('mediconnect/vitals/#');
-    });
+    try {
+        console.log(`📡 Connecting to AWS IoT Bridge...`);
+        const mqttClient = connect(process.env.MQTT_BROKER_URL);
+        
+        mqttClient.on('connect', () => {
+            console.log("✅ Connected to AWS IoT Secure Broker");
+            mqttClient.subscribe('mediconnect/vitals/#');
+        });
 
-    mqttClient.on('message', async (topic, message) => {
-        try {
-            const payload = JSON.parse(message.toString());
-            const patientId = topic.split('/').pop() || "unknown";
-            const heartRate = Number(payload.heartRate);
-            const region = payload.region || "us-east-1";
+        // 🟢 CRITICAL FIX: Handle connection errors so they don't crash the server
+        mqttClient.on('error', (err) => {
+            console.error("⚠️ MQTT Connection Error (Non-Fatal):", err.message);
+        });
 
-            if (heartRate > 150) {
-                console.warn(`🚨 EMERGENCY: High Heart Rate [${heartRate}] for Patient ${patientId}`);
-                await handleEmergencyDetection(patientId, heartRate, 'EMERGENCY_AUTO_IOT', region);
-                io.to(`patient_${patientId}`).emit('critical_vital_alert', {
-                    message: "High Heart Rate Detected!", heartRate, level: "CRITICAL"
-                });
-            }
-            io.to(`patient_${patientId}`).emit('vital_update', { ...payload, timestamp: new Date().toISOString() });
-        } catch (e) { console.error("MQTT Message Error"); }
-    });
+        mqttClient.on('message', async (topic, message) => {
+            try {
+                const payload = JSON.parse(message.toString());
+                const patientId = topic.split('/').pop() || "unknown";
+                const heartRate = Number(payload.heartRate);
+                const region = payload.region || "us-east-1";
 
-    io.on('connection', (socket) => {
-        socket.on('join_monitoring', (pid) => socket.join(`patient_${pid}`));
-    });
+                if (heartRate > 150) {
+                    console.warn(`🚨 EMERGENCY: High Heart Rate [${heartRate}] for Patient ${patientId}`);
+                    await handleEmergencyDetection(patientId, heartRate, 'EMERGENCY_AUTO_IOT', region);
+                    io.to(`patient_${patientId}`).emit('critical_vital_alert', {
+                        message: "High Heart Rate Detected!", heartRate, level: "CRITICAL"
+                    });
+                }
+                io.to(`patient_${patientId}`).emit('vital_update', { ...payload, timestamp: new Date().toISOString() });
+            } catch (e) { console.error("MQTT Message Error"); }
+        });
+
+        io.on('connection', (socket) => {
+            socket.on('join_monitoring', (pid) => socket.join(`patient_${pid}`));
+        });
+    } catch (error: any) {
+        console.error("❌ Failed to initialize IoT Bridge:", error.message);
+    }
 };
 
 // --- 5. START SERVER ---
@@ -196,7 +219,9 @@ const startServer = async () => {
             safeLog(`🚀 Patient Service Production Ready on port ${PORT}`);
         });
     } catch (err: any) {
-        safeError('❌ FATAL: Application failed to start:', err.message);
+        // 🟢 FIX: Ensure we print the error even if it's not a standard Error object
+        const errMsg = err?.message || JSON.stringify(err);
+        safeError('❌ FATAL: Application failed to start:', errMsg);
         process.exit(1);
     }
 };
