@@ -109,4 +109,4 @@ jobs:
             --port 8082 \
             --platform managed \
             --allow-unauthenticated \
-            --set-env-vars NODE_ENV=production,PORT=8082
+            --set-env-vars NODE_ENV=production
