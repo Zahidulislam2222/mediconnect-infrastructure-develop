@@ -165,21 +165,28 @@ const startIoTBridge = () => {
     }
 
     try {
-        console.log(`📡 Calculating Secure SigV4 Connection...`);
+        // 🟢 FIX 1: Extract region directly from URL to prevent Signature Mismatch
+        // Ensures signature matches the 'us-east-1' or 'eu-central-1' host in the URL
+        const brokerHost = process.env.MQTT_BROKER_URL.replace('mqtts://', '').replace('wss://', '').split('/')[0];
+        const brokerRegion = brokerHost.split('.')[2] || 'us-east-1';
+
+        console.log(`📡 Calculating Secure SigV4 Connection for [${brokerRegion}]...`);
         
-        // 🟢 THE FIX: Sign the URL using AWS Access Keys
         const signedUrl = getSignedIoTUrl(
             process.env.MQTT_BROKER_URL,
-            process.env.AWS_REGION || 'us-east-1',
+            brokerRegion, // 🟢 Derived Region
             process.env.AWS_ACCESS_KEY_ID || '',
             process.env.AWS_SECRET_ACCESS_KEY || '',
             process.env.AWS_SESSION_TOKEN
         );
 
+        // 🟢 FIX 2: Generate Unique Client ID to stop the ECONNRESET loop (ID Conflict)
         const mqttClient = connect(signedUrl, {
-            connectTimeout: 5000,
+            connectTimeout: 10000,
             reconnectPeriod: 5000,
-            protocol: 'wss' // Force Secure WebSocket
+            protocol: 'wss',
+            clientId: `patient-service-${brokerRegion}-${Math.random().toString(16).substring(2, 10)}`,
+            keepalive: 60
         });
         
         mqttClient.on('connect', () => {
@@ -188,7 +195,7 @@ const startIoTBridge = () => {
         });
 
         mqttClient.on('error', (err) => {
-            console.error("⚠️ MQTT Error:", err.message);
+            console.error("⚠️ MQTT Connection Error (Non-Fatal):", err.message);
         });
 
         mqttClient.on('message', async (topic, message) => {
@@ -196,7 +203,7 @@ const startIoTBridge = () => {
                 const payload = JSON.parse(message.toString());
                 const patientId = topic.split('/').pop() || "unknown";
                 const heartRate = Number(payload.heartRate);
-                const region = payload.region || "us-east-1";
+                const region = payload.region || brokerRegion;
 
                 if (heartRate > 150) {
                     await handleEmergencyDetection(patientId, heartRate, 'EMERGENCY_AUTO_IOT', region);
@@ -205,11 +212,14 @@ const startIoTBridge = () => {
                     });
                 }
                 io.to(`patient_${patientId}`).emit('vital_update', { ...payload, timestamp: new Date().toISOString() });
-            } catch (e) { console.error("Message Error"); }
+            } catch (e) { console.error("MQTT Message Error"); }
         });
 
         io.on('connection', (socket) => {
-            socket.on('join_monitoring', (pid) => socket.join(`patient_${pid}`));
+            socket.on('join_monitoring', (pid) => {
+                socket.join(`patient_${pid}`);
+                console.log(`👁️ Monitoring session started for patient: ${pid}`);
+            });
         });
     } catch (error: any) {
         console.error("❌ Failed to initialize IoT Bridge:", error.message);
