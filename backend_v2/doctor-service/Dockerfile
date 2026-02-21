@@ -26,14 +26,15 @@ WORKDIR /app
 RUN chown -R node:node /app
 USER node
 
-# Copy compiled code and prod dependencies
+# 🟢 FIXED: We now copy the entire dist folder to preserve the relative 
+# path (../../shared/logger) required by your index.ts imports.
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
-COPY --from=builder --chown=node:node /app/doctor-service/dist ./dist
+COPY --from=builder --chown=node:node /app/dist ./dist
 COPY --from=builder --chown=node:node /app/doctor-service/package*.json ./
 
 ENV NODE_ENV=production
 ENV PORT=8082
 EXPOSE 8082
 
-# Start the service
+# 🟢 FIXED: Point to the absolute path in the unified dist folder
 CMD ["node", "dist/doctor-service/src/index.js"]
