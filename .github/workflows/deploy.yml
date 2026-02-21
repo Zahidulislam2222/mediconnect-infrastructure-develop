@@ -1,4 +1,4 @@
-name: 🚀 Global Multi-Cloud Deploy (Doctor Service)
+name: "🚀 Global Multi-Cloud Deploy (Doctor Service)"
 
 on:
   push:
@@ -18,20 +18,20 @@ jobs:
   # JOB 1: DEPLOY TO AZURE (US Region - HIPAA)
   # =========================================================
   deploy-azure-us:
-    runs-on: ubuntu-latest
+    runs-on: "ubuntu-latest"
     steps:
-      - name: 📥 Checkout Code
+      - name: "📥 Checkout Code"
         uses: actions/checkout@v4
 
-      - name: 🔐 Azure Login
+      - name: "🔐 Azure Login"
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: 🔑 Login to Azure Container Registry (ACR)
+      - name: "🔑 Login to Azure Container Registry (ACR)"
         run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
 
-      - name: 🧹 ZERO-ASSUMPTION FIX: Sanitize Build Context
+      - name: "🧹 ZERO-ASSUMPTION FIX: Sanitize Build Context"
         run: |
           echo "Destroying restrictive .dockerignore files that block the Linux runner..."
           find . -name ".dockerignore" -delete
@@ -43,20 +43,20 @@ jobs:
           echo "backend_v2/doctor-service/node_modules" >> .dockerignore
           echo "backend_v2/patient-service/node_modules" >> .dockerignore
 
-      - name: 🐳 Build and Push Docker Image
+      - name: "🐳 Build and Push Docker Image"
         run: |
           IMAGE_TAG=${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}
           docker build -t $IMAGE_TAG -f backend_v2/doctor-service/Dockerfile .
           docker push $IMAGE_TAG
 
-      - name: 🚀 Deploy to Azure Container Apps
+      - name: "🚀 Deploy to Azure Container Apps"
         uses: azure/container-apps-deploy-action@v1
         with:
-          appSourcePath: ${{ github.workspace }}/backend_v2
+          appSourcePath: "${{ github.workspace }}/backend_v2"
           acrName: ${{ env.AZURE_CONTAINER_REGISTRY }}
-          containerAppName: doctor-service
+          containerAppName: "doctor-service"
           resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
-          imageToDeploy: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}
+          imageToDeploy: "${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}"
           environmentVariables: |
             NODE_ENV=production
             AWS_REGION=us-east-1
@@ -65,23 +65,23 @@ jobs:
   # JOB 2: DEPLOY TO GCP (EU Region - GDPR)
   # =========================================================
   deploy-gcp-eu:
-    runs-on: ubuntu-latest
+    runs-on: "ubuntu-latest"
     steps:
-      - name: 📥 Checkout Code
+      - name: "📥 Checkout Code"
         uses: actions/checkout@v4
 
-      - name: 🔐 Authenticate to Google Cloud
+      - name: "🔐 Authenticate to Google Cloud"
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_CREDENTIALS }}
 
-      - name: 🛠️ Set up Google Cloud SDK
+      - name: "🛠️ Set up Google Cloud SDK"
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: 🔑 Configure Docker for GCP Artifact Registry
+      - name: "🔑 Configure Docker for GCP Artifact Registry"
         run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 
-      - name: 🧹 ZERO-ASSUMPTION FIX: Sanitize Build Context
+      - name: "🧹 ZERO-ASSUMPTION FIX: Sanitize Build Context"
         run: |
           echo "Destroying restrictive .dockerignore files that block the Linux runner..."
           find . -name ".dockerignore" -delete
@@ -93,13 +93,13 @@ jobs:
           echo "backend_v2/doctor-service/node_modules" >> .dockerignore
           echo "backend_v2/patient-service/node_modules" >> .dockerignore
 
-      - name: 🐳 Build and Push Docker Image to GCP
+      - name: "🐳 Build and Push Docker Image to GCP"
         run: |
           IMAGE_TAG=${{ env.GCP_REPO }}/doctor-service-eu:${{ github.sha }}
           docker build -t $IMAGE_TAG -f backend_v2/doctor-service/Dockerfile .
           docker push $IMAGE_TAG
 
-      - name: 🚀 Deploy to Cloud Run (Europe-West3 / Frankfurt)
+      - name: "🚀 Deploy to Cloud Run (Europe-West3 / Frankfurt)"
         run: |
           IMAGE_TAG=${{ env.GCP_REPO }}/doctor-service-eu:${{ github.sha }}
           gcloud run deploy doctor-service-eu \
