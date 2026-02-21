@@ -20,24 +20,32 @@ jobs:
     steps:
       - name: "📥 Checkout Code"
         uses: actions/checkout@v4
-        
+      
       - name: "🔐 Azure Login"
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-          
+      
       - name: "🔑 Login to ACR"
         run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
-        
+      
       - name: "🧹 Sanitize Build Context"
         run: find . -name ".dockerignore" -delete
-        
+      
       - name: "🐳 Build and Push to Azure"
         run: |
           IMAGE_TAG=${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}
           docker build -t $IMAGE_TAG -f backend_v2/doctor-service/Dockerfile .
           docker push $IMAGE_TAG
-          
+
+      - name: "🔐 Push Secrets to Azure"
+        # 🟢 AZURE FIX: Use CLI to create secrets because the Action doesn't support creating them on the fly
+        run: |
+          az containerapp secret set \
+            --name doctor-service \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --secrets "aws-access-key-id=${{ secrets.AWS_ACCESS_KEY_ID }}" "aws-secret-access-key=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+      
       - name: "🚀 Deploy Azure Container App"
         uses: azure/container-apps-deploy-action@v1
         with:
@@ -45,8 +53,7 @@ jobs:
           containerAppName: "doctor-service"
           resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
           imageToDeploy: "${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}"
-          # 🟢 HIPAA 100% FIX: Keys are stored as hidden secrets, not plain text env vars
-          secrets: "aws-access-key-id=${{ secrets.AWS_ACCESS_KEY_ID }} aws-secret-access-key=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          # 🟢 Secrets are now referenced securely from the step above
           environmentVariables: "NODE_ENV=production AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=secretref:aws-access-key-id AWS_SECRET_ACCESS_KEY=secretref:aws-secret-access-key"
 
   deploy-gcp-eu:
