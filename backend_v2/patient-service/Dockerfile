@@ -2,38 +2,36 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 
-# 1. Copy the monorepo root package files
-COPY package*.json ./
+# 1. Copy the monorepo package files
+COPY backend_v2/package*.json ./
 
-# 2. Copy the patient-service package files into their own folder
+# 2. Create the service directory and copy its package files
 RUN mkdir -p ./patient-service
-COPY patient-service/package*.json ./patient-service/
+COPY backend_v2/patient-service/package*.json ./patient-service/
 
-# 3. 🟢 THE FIX: Install dependencies INSIDE the patient-service folder
-# This ensures socket.io and mqtt are physically installed where the code needs them
-WORKDIR /app/patient-service
-RUN npm install
+# 3. Install dependencies at the /app level
+RUN npm ci
 
-# 4. Copy the source code (Shared and Service)
-WORKDIR /app
-COPY shared ./shared
-COPY patient-service ./patient-service
+# 4. Copy the source code
+COPY backend_v2/shared ./shared
+COPY backend_v2/patient-service ./patient-service
 
-# 5. Build the Service
+# 5. Build
 WORKDIR /app/patient-service
 RUN ../node_modules/.bin/tsc --project tsconfig.json
 
-# --- STAGE 2: RUNNER ---
+# 6. 🟢 DOCKER 100% FIX: Prune dev dependencies at the root level!
+WORKDIR /app
+RUN npm prune --omit=dev 
+
+# --- STAGE 2: RUNNER (Production) ---
 FROM node:20-alpine
 WORKDIR /app
-
-# Security: Run as non-root
 RUN chown -R node:node /app
 USER node
 
-# 🟢 THE FIX: Copy node_modules from the SERVICE folder, not the root
-# This guarantees that the runtime finds 'socket.io'
-COPY --from=builder --chown=node:node /app/patient-service/node_modules ./node_modules
+# 🟢 FIXED PATH: Copy node_modules from the root /app folder, NOT patient-service
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/patient-service/dist ./dist
 COPY --from=builder --chown=node:node /app/patient-service/package*.json ./
 
@@ -41,5 +39,4 @@ ENV NODE_ENV=production
 ENV PORT=8081
 EXPOSE 8081
 
-# 🟢 THE FIX: Point the CMD to the exact path where the compiler puts the file
 CMD ["node", "dist/patient-service/src/index.js"]
