@@ -11,6 +11,7 @@ import { GetParametersCommand } from "@aws-sdk/client-ssm";
 // Shared Utilities
 import { safeLog, safeError } from '../../shared/logger';
 import { getRegionalSSMClient } from './config/aws';
+import { getSignedIoTUrl } from './utils/iot-signer'; // 🟢 IMPORT THE SIGNER
 
 import patientRoutes from './routes/patient.routes';
 import iotRoutes from "./modules/iot/iot.routes";
@@ -81,7 +82,7 @@ app.use(morgan((tokens, req, res) => {
 }, { skip: (req) => req.url === '/health' || req.method === 'OPTIONS' }));
 
 
-// --- 3. 100% COMPLIANT VAULT SYNC (BATCHED & EXPLICIT) ---
+// --- 3. 100% COMPLIANT VAULT SYNC ---
 async function loadSecrets() {
     const region = process.env.AWS_REGION || 'us-east-1';
     const ssm = getRegionalSSMClient(region);
@@ -101,7 +102,7 @@ async function loadSecrets() {
             WithDecryption: true
         });
 
-        // Batch 2: Identity (Explicit + Local)
+        // Batch 2: Identity
         const cmdIdentity = new GetParametersCommand({
             Names: [
                 '/mediconnect/prod/cognito/user_pool_id',
@@ -146,7 +147,6 @@ async function loadSecrets() {
             if (p.Name.includes('client_id_eu_doctor')) process.env.COGNITO_CLIENT_ID_EU_DOCTOR = p.Value;
         });
 
-        // Local Fallbacks
         if (!process.env.COGNITO_CLIENT_ID_US_PATIENT) process.env.COGNITO_CLIENT_ID_US_PATIENT = process.env.COGNITO_CLIENT_ID;
         if (!process.env.COGNITO_CLIENT_ID_US_DOCTOR) process.env.COGNITO_CLIENT_ID_US_DOCTOR = process.env.COGNITO_CLIENT_ID_DOCTOR_LOCAL;
 
@@ -157,7 +157,7 @@ async function loadSecrets() {
     }
 }
 
-// --- 4. IOT BRIDGE ---
+// --- 4. IOT BRIDGE (AUTHENTICATED) ---
 const startIoTBridge = () => {
     if (!process.env.MQTT_BROKER_URL) {
         console.warn("⚠️ MQTT Bridge Skipped: No Broker URL Found");
@@ -165,17 +165,30 @@ const startIoTBridge = () => {
     }
 
     try {
-        console.log(`📡 Connecting to AWS IoT Bridge...`);
-        const mqttClient = connect(process.env.MQTT_BROKER_URL);
+        console.log(`📡 Calculating Secure SigV4 Connection...`);
+        
+        // 🟢 THE FIX: Sign the URL using AWS Access Keys
+        const signedUrl = getSignedIoTUrl(
+            process.env.MQTT_BROKER_URL,
+            process.env.AWS_REGION || 'us-east-1',
+            process.env.AWS_ACCESS_KEY_ID || '',
+            process.env.AWS_SECRET_ACCESS_KEY || '',
+            process.env.AWS_SESSION_TOKEN
+        );
+
+        const mqttClient = connect(signedUrl, {
+            connectTimeout: 5000,
+            reconnectPeriod: 5000,
+            protocol: 'wss' // Force Secure WebSocket
+        });
         
         mqttClient.on('connect', () => {
-            console.log("✅ Connected to AWS IoT Secure Broker");
+            console.log("✅ Connected to AWS IoT Core (Securely Signed)");
             mqttClient.subscribe('mediconnect/vitals/#');
         });
 
-        // 🟢 CRITICAL FIX: Handle connection errors so they don't crash the server
         mqttClient.on('error', (err) => {
-            console.error("⚠️ MQTT Connection Error (Non-Fatal):", err.message);
+            console.error("⚠️ MQTT Error:", err.message);
         });
 
         mqttClient.on('message', async (topic, message) => {
@@ -186,14 +199,13 @@ const startIoTBridge = () => {
                 const region = payload.region || "us-east-1";
 
                 if (heartRate > 150) {
-                    console.warn(`🚨 EMERGENCY: High Heart Rate [${heartRate}] for Patient ${patientId}`);
                     await handleEmergencyDetection(patientId, heartRate, 'EMERGENCY_AUTO_IOT', region);
                     io.to(`patient_${patientId}`).emit('critical_vital_alert', {
                         message: "High Heart Rate Detected!", heartRate, level: "CRITICAL"
                     });
                 }
                 io.to(`patient_${patientId}`).emit('vital_update', { ...payload, timestamp: new Date().toISOString() });
-            } catch (e) { console.error("MQTT Message Error"); }
+            } catch (e) { console.error("Message Error"); }
         });
 
         io.on('connection', (socket) => {
@@ -219,7 +231,6 @@ const startServer = async () => {
             safeLog(`🚀 Patient Service Production Ready on port ${PORT}`);
         });
     } catch (err: any) {
-        // 🟢 FIX: Ensure we print the error even if it's not a standard Error object
         const errMsg = err?.message || JSON.stringify(err);
         safeError('❌ FATAL: Application failed to start:', errMsg);
         process.exit(1);
