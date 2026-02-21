@@ -14,13 +14,6 @@ import { getRegionalSSMClient } from './config/aws';
 
 dotenv.config();
 
-// --- ADD THIS DEBUG BLOCK ---
-console.log("--- SECRETS DEBUG CHECK ---");
-console.log("REGION:", process.env.AWS_REGION);
-console.log("ACCESS_KEY Length:", process.env.AWS_ACCESS_KEY_ID ? process.env.AWS_ACCESS_KEY_ID.length : 0);
-console.log("SECRET_KEY Length:", process.env.AWS_SECRET_ACCESS_KEY ? process.env.AWS_SECRET_ACCESS_KEY.length : 0);
-console.log("---------------------------");
-
 const app = express();
 
 // 🟢 SECURITY: DDoS Protection (100 requests / 15 mins)
@@ -172,5 +165,3 @@ const startServer = async () => {
 };
 
 startServer();// Triggering deployment fix
-// Triggering deployment fix
-// Triggering deployment fix
