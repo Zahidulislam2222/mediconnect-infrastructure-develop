@@ -110,7 +110,7 @@ async function loadSecrets() {
             Names: [
                 '/mediconnect/prod/kms/signing_key_id',
                 // US Identity
-                '/mediconnect/prod/cognito/client_id',
+                '/mediconnect/prod/cognito/client_id_doctor',
                 '/mediconnect/prod/cognito/user_pool_id',
                 // EU Identity (GDPR)
                 '/mediconnect/prod/cognito/user_pool_id_eu',
@@ -127,14 +127,18 @@ async function loadSecrets() {
         }
 
         Parameters?.forEach((p: any) => {
-    if (p.Name && p.Name.includes('kms/signing_key_id')) process.env.KMS_KEY_ID = p.Value;
+            
+            if (p.Name && p.Name.includes('kms/signing_key_id')) process.env.KMS_KEY_ID = p.Value;
             
             // Map US
-            if (p.Name === '/mediconnect/prod/cognito/client_id') process.env.COGNITO_CLIENT_ID = p.Value;
+            if (p.Name === '/mediconnect/prod/cognito/client_id_doctor') process.env.COGNITO_CLIENT_ID = p.Value;
             if (p.Name === '/mediconnect/prod/cognito/user_pool_id') process.env.COGNITO_USER_POOL_ID = p.Value;
             
             // Map EU
             if (p.Name === '/mediconnect/prod/cognito/user_pool_id_eu') process.env.COGNITO_USER_POOL_ID_EU = p.Value;
+
+            // 🟢 THE FIX FOR PROBLEM 2: Save the database table name
+            if (p.Name === '/mediconnect/prod/db/dynamo_table') process.env.DYNAMO_TABLE = p.Value;
         });
         console.log("✅ AWS Vault Sync Complete.");
     } catch (e: any) {
