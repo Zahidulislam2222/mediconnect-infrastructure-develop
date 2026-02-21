@@ -30,8 +30,12 @@ async function getBigQueryClient() {
 const DATASET_ID = "mediconnect_analytics";
 const TABLE_ID = "appointments_stream";
 
-export const analyticsHandler = async (event: any) => {
+export const analyticsHandler = async (event: any, region: string = "us-east-1") => {
     const rowsToInsert: any[] = [];
+    
+    // 🟢 100% GDPR COMPLIANT DATASET ROUTING
+    const DATASET_ID = region.toUpperCase() === 'EU' ? "mediconnect_analytics_eu" : "mediconnect_analytics";
+    const TABLE_ID = "appointments_stream";
 
     // Parse DynamoDB Stream Records
     if (event.Records) {
@@ -62,7 +66,7 @@ export const analyticsHandler = async (event: any) => {
     try {
         const bq = await getBigQueryClient();
         await bq.dataset(DATASET_ID).table(TABLE_ID).insert(rowsToInsert);
-        return { message: `Synced ${rowsToInsert.length} rows to BigQuery` };
+        return { message: `Synced ${rowsToInsert.length} rows to BigQuery [${DATASET_ID}]` };
 
     } catch (error: any) {
         console.error("BigQuery Sync Failed. Sending to DLQ...", error);

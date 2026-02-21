@@ -6,3 +6,13 @@ node_modules/
 .env
 .env.*
 npm-debug.log
+
+.gcloudignore
+.git
+.gitignore
+node_modules/
+**/node_modules/
+.env
+dist/
+**/dist/
+*.md

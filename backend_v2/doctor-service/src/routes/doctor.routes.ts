@@ -4,44 +4,65 @@ import { authMiddleware } from '../middleware/auth.middleware';
 
 const router = Router();
 
-// ==========================================
-// 1. DOCTOR PROFILE ROUTES
-// ==========================================
+// =============================================================================
+// 1. DOCTOR PROFILE ROUTES (HIPAA & GDPR Compliant)
+// =============================================================================
 
-// Create Doctor (Public)
-router.post('/doctors', DoctorController.createDoctor);
-router.post('/register-doctor', DoctorController.createDoctor);
+/**
+ * 🟢 HIPAA SECURITY FIX: Protected Registration
+ * We now force authMiddleware on creation. This ensures a verified JWT 
+ * exists BEFORE we try to write to the medical database.
+ */
+router.post('/doctors', authMiddleware, DoctorController.createDoctor);
+router.post('/register-doctor', authMiddleware, DoctorController.createDoctor);
 
-// 🟢 FIX: Add GET route for Dashboard Profile Load
-// This maps /register-doctor?id=... to getDoctor
+// Profile Loading for Dashboards
 router.get('/register-doctor', authMiddleware, DoctorController.getDoctor);
 
-// Get Doctor Directory (Protected)
+// 🟢 HIPAA PRIVACY: Sanitized Directory (Filters unverified/private data)
 router.get('/doctors', authMiddleware, DoctorController.getDoctors);
 
-// Get Specific Doctor (Protected)
+// Get Specific Doctor
 router.get('/doctors/:id', authMiddleware, DoctorController.getDoctor);
 
-// Update Doctor (Protected)
+/**
+ * 🟢 GDPR FIX: Right to Rectification
+ * Added the missing PUT route so users can update their own medical profile data.
+ */
 router.put('/doctors/:id', authMiddleware, DoctorController.updateDoctor);
 
-// ==========================================
+/**
+ * 🟢 GDPR FIX: Right to Erasure
+ * Deletion route for account anonymization.
+ */
+router.delete('/doctors/:id', authMiddleware, DoctorController.deleteDoctor);
+
+
+// =============================================================================
 // 2. SCHEDULE ROUTES
-// ==========================================
+// =============================================================================
 router.get('/doctors/:id/schedule', authMiddleware, DoctorController.getSchedule);
 router.post('/doctors/:id/schedule', authMiddleware, DoctorController.updateSchedule);
 
-// ==========================================
-// 3. VERIFICATION ROUTES
-// ==========================================
+
+// =============================================================================
+// 3. VERIFICATION ROUTES (AI-Driven)
+// =============================================================================
 router.post('/doctors/:id/verify-diploma', authMiddleware, DoctorController.verifyDiploma);
 
-// ==========================================
-// 4. GOOGLE CALENDAR ROUTES (🟢 NEW)
-// ==========================================
+
+// =============================================================================
+// 4. GOOGLE CALENDAR ROUTES (CSRF Protected)
+// =============================================================================
 router.get('/doctors/:id/calendar/status', authMiddleware, DoctorController.getCalendarStatus);
 router.get('/doctors/auth/google', authMiddleware, DoctorController.connectGoogleCalendar);
-router.get('/doctors/auth/google/callback', DoctorController.googleCallback); // Callback handles its own state
+
+/**
+ * 🟢 SECURITY NOTE: Google Callback remains public.
+ * Security is enforced via a signed JWT state parameter in the Controller.
+ */
+router.get('/doctors/auth/google/callback', DoctorController.googleCallback);
+
 router.delete('/doctors/:id/calendar', authMiddleware, DoctorController.disconnectGoogleCalendar);
 
 export default router;

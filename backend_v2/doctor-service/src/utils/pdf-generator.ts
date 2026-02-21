@@ -1,8 +1,15 @@
 import PDFDocument from "pdfkit";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { KMSClient, SignCommand } from "@aws-sdk/client-kms";
+import { PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { SignCommand } from "@aws-sdk/client-kms";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { getSSMParameter } from "../config/aws"; // Shared config
+import { v4 as uuidv4 } from "uuid";
+
+// 🟢 ARCHITECTURE FIX: Use Shared Factories to prevent Socket Exhaustion and Data Leaks
+import { 
+    getRegionalS3Client, 
+    getRegionalKMSClient, // 🔍 Ensure this is exported in your shared/aws-config.ts
+    getSSMParameter 
+} from "../config/aws"; 
 
 interface PrescriptionData {
     prescriptionId: string;
@@ -15,68 +22,80 @@ interface PrescriptionData {
 }
 
 export class PDFGenerator {
-    private s3Client: S3Client;
-    private kmsClient: KMSClient;
-    private bucketName: string;
     private kmsKeyId: string;
 
     constructor() {
-        this.s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
-        this.kmsClient = new KMSClient({ region: process.env.AWS_REGION || "us-east-1" });
-        this.bucketName = process.env.S3_BUCKET_PRESCRIPTIONS || "mediconnect-prescriptions"
         this.kmsKeyId = process.env.KMS_KEY_ID || "";
     }
 
     /**
-     * Generates a signed PDF and returns the S3 Presigned URL + Digital Signature
+     * Generates a signed PDF and returns the S3 Presigned URL + FHIR Metadata
+     * 🟢 GDPR FIX: Now accepts 'region' to ensure data residency compliance.
      */
-    public async generatePrescriptionPDF(data: PrescriptionData): Promise<{ pdfUrl: string, signature: string }> {
-        // 1. Digital Signature Generation (Verification Integrity)
-        const signature = await this.signData(data);
+    public async generatePrescriptionPDF(data: PrescriptionData, region: string = "us-east-1"): 
+        Promise<{ pdfUrl: string, signature: string, fhirMetadata: any }> {
+        
+        // 1. Digital Signature Generation (Regional KMS)
+        const signature = await this.signData(data, region);
 
         // 2. Generate PDF Buffer
         const pdfBuffer = await this.createPDFBuffer(data, signature);
 
-        // 3. Upload to S3
+        // 3. Resolve Regional Infrastructure
+        const s3Client = getRegionalS3Client(region);
+        const isEU = region.toUpperCase().includes('EU');
+        const bucketName = isEU 
+            ? (process.env.S3_BUCKET_PRESCRIPTIONS_EU || "mediconnect-prescriptions-eu")
+            : (process.env.S3_BUCKET_PRESCRIPTIONS_US || "mediconnect-prescriptions");
+
+        // 4. Upload to Regional S3 (GDPR Sovereignty)
         const s3Key = `prescriptions/${data.prescriptionId}.pdf`;
-        await this.s3Client.send(new PutObjectCommand({
-            Bucket: this.bucketName,
+        await s3Client.send(new PutObjectCommand({
+            Bucket: bucketName,
             Key: s3Key,
             Body: pdfBuffer,
-            ContentType: "application/pdf"
+            ContentType: "application/pdf",
+            // 🟢 HIPAA: Ensure encryption at rest
+            ServerSideEncryption: "aws:kms" 
         }));
 
-        // 4. Generate Presigned View URL (Valid for 15 mins)
-        // We use a separate GetObject command to generate the signed URL for the user to view it
-        // Note: The previous PutObject was for uploading. Now we construct a Get URL.
-        // Wait... client needs a URL to VIEW/DOWNLOAD the file we just made.
-        // We can't use the PutObjectCommand for getSignedUrl if we want a GET url.
-        // We must use GetObjectCommand.
-
-        const getCommand = {
-            Bucket: this.bucketName,
+        // 5. Generate Presigned View URL (Valid for 15 mins)
+        const signedUrl = await getSignedUrl(s3Client, new GetObjectCommand({
+            Bucket: bucketName,
             Key: s3Key
+        }), { expiresIn: 900 });
+
+        // 6. 🟢 FHIR R4 COMPLIANCE: Wrap file in a DocumentReference
+        const fhirMetadata = {
+            resourceType: "DocumentReference",
+            id: uuidv4(),
+            status: "current",
+            type: { text: "Digital Prescription" },
+            subject: { display: data.patientName },
+            author: [{ display: data.doctorName }],
+            date: data.timestamp,
+            content: [{
+                attachment: {
+                    contentType: "application/pdf",
+                    url: s3Key,
+                    hash: signature // Signature used as integrity hash
+                }
+            }]
         };
-        // @ts-ignore - Importing GetObjectCommand dynamically or assuming it's available in context
-        // Actual implementation requires importing GetObjectCommand from client-s3.
-        // For now, assuming standard flow.
 
-        // Let's create a fresh command for signing the GET request
-        const { GetObjectCommand } = await import("@aws-sdk/client-s3");
-        const signedUrl = await getSignedUrl(this.s3Client, new GetObjectCommand(getCommand), { expiresIn: 900 });
-
-        return { pdfUrl: signedUrl, signature };
+        return { pdfUrl: signedUrl, signature, fhirMetadata };
     }
 
-    private async signData(data: PrescriptionData): Promise<string> {
-        // Fetch Key ID if not env var (from SSM)
+    private async signData(data: PrescriptionData, region: string): Promise<string> {
         if (!this.kmsKeyId) {
             const keyId = await getSSMParameter("/mediconnect/prod/kms/signing_key_id");
             if (!keyId) throw new Error("KMS Key ID not configured");
             this.kmsKeyId = keyId;
         }
 
+        const kmsClient = getRegionalKMSClient(region);
         const payload = JSON.stringify(data);
+        
         const command = new SignCommand({
             KeyId: this.kmsKeyId,
             Message: Buffer.from(payload),
@@ -84,7 +103,7 @@ export class PDFGenerator {
             SigningAlgorithm: "RSASSA_PKCS1_V1_5_SHA_256"
         });
 
-        const response = await this.kmsClient.send(command);
+        const response = await kmsClient.send(command);
         return Buffer.from(response.Signature!).toString('base64');
     }
 
@@ -100,21 +119,17 @@ export class PDFGenerator {
             // --- PDF CONTENT ---
             doc.fontSize(20).text("MediConnect Digital Prescription", { align: "center" });
             doc.moveDown();
-
             doc.fontSize(12).text(`Prescription ID: ${data.prescriptionId}`);
             doc.text(`Date: ${data.timestamp}`);
             doc.moveDown();
-
             doc.text(`Patient: ${data.patientName}`);
             doc.text(`Doctor: ${data.doctorName}`);
             doc.moveDown();
-
             doc.font('Helvetica-Bold').text("Medication Details:");
             doc.font('Helvetica').text(`Drug: ${data.medication}`);
             doc.text(`Dosage: ${data.dosage}`);
             doc.text(`Instructions: ${data.instructions}`);
             doc.moveDown(2);
-
             doc.fontSize(10).fillColor('grey').text(`Digital Signature: ${signature}`);
             doc.text("This document is digitally signed and HIPAA compliant.", { align: "center" });
 

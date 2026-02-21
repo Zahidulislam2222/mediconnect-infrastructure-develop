@@ -1,84 +1,62 @@
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
-import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
-import { S3Client } from "@aws-sdk/client-s3";
-import { RekognitionClient } from "@aws-sdk/client-rekognition";
-import { NodeHttpHandler } from "@smithy/node-http-handler";
+import { GetParameterCommand } from "@aws-sdk/client-ssm";
 
-const region = process.env.AWS_REGION || "us-east-1";
+// 🟢 ARCHITECTURE FIX: Import everything from the Shared Factory.
+// This completely eliminates "Code Drift" between microservices.
+import { 
+    getRegionalClient, 
+    getRegionalS3Client, 
+    getRegionalRekognitionClient, 
+    getRegionalSNSClient,
+    getRegionalSSMClient,
+    COGNITO_CONFIG 
+} from "../../../shared/aws-config";
 
-// Optimization: Shared HTTP Handler to prevent socket exhaustion
-const requestHandler = new NodeHttpHandler({
-    connectionTimeout: 5000,
-    socketTimeout: 5000,
-});
+// 🟢 Re-export the factories so `doctor.controller.ts` doesn't break its imports.
+export { 
+    getRegionalClient, 
+    getRegionalS3Client, 
+    getRegionalRekognitionClient, 
+    getRegionalSNSClient,
+    COGNITO_CONFIG
+};
 
-// 1. Core Clients
-export const s3Client = new S3Client({ region, requestHandler });
-export const rekognitionClient = new RekognitionClient({ region, requestHandler });
-export const ssmClient = new SSMClient({ region, requestHandler });
+// 🟢 GDPR FIX: 'docClient' export is PERMANENTLY DELETED. 
+// Developers can no longer accidentally save EU data to the US by using a static default.
 
-// 2. DynamoDB (Encryption at rest enabled by default in AWS)
-export const dbClient = new DynamoDBClient({ region, requestHandler });
-export const docClient = DynamoDBDocumentClient.from(dbClient, {
-    marshallOptions: { removeUndefinedValues: true }
-});
+// =========================================================================
+// 🔐 DOCTOR-SERVICE SPECIFIC SECRETS CACHE
+// =========================================================================
 
-const secretsClient = new SecretsManagerClient({ region, requestHandler });
 const secretCache: Record<string, string> = {};
 
-/**
- * Robust Secret Fetcher (Fail-Safe)
- * 1. Checks Process Env (Cloud Run / Azure Portal)
- * 2. Checks Memory Cache
- * 3. Fetches from AWS SSM
- */
 export const getSSMParameter = async (path: string, isSecure: boolean = true): Promise<string | undefined> => {
-    // 1. Priority: Environment Variables
+    
+    // 1. Reactive Check: Environment Variables First
     const envMap: Record<string, string | undefined> = {
-        '/mediconnect/db/dynamo_table': process.env.DYNAMO_TABLE,
-        '/mediconnect/s3/bucket_name': process.env.BUCKET_NAME,
-        '/mediconnect/prod/cognito/client_id': process.env.COGNITO_CLIENT_ID,
-        '/mediconnect/prod/cognito/user_pool_id': process.env.COGNITO_USER_POOL_ID,
-        '/mediconnect/stripe/keys': process.env.STRIPE_SECRET_KEY,
-        '/mediconnect/prod/cleanup/secret': process.env.CLEANUP_SECRET
+        '/mediconnect/prod/kms/signing_key_id': process.env.KMS_KEY_ID,
+        '/mediconnect/prod/cognito/client_id': COGNITO_CONFIG.US.CLIENT_DOCTOR,
+        '/mediconnect/prod/cognito/user_pool_id': COGNITO_CONFIG.US.USER_POOL_ID,
+        '/mediconnect/prod/cognito/user_pool_id_eu': COGNITO_CONFIG.EU.USER_POOL_ID
     };
 
-    if (envMap[path]) return envMap[path];
+    if (envMap[path] && envMap[path] !== '') return envMap[path];
+    
+    // 2. Cache Check: Prevent rate-limiting from AWS SSM
     if (secretCache[path]) return secretCache[path];
 
-    // 2. Network Fetch (Fail-Safe)
+    // 3. Network Fetch using the Shared Regional Client (Default to US for Global Secrets)
     try {
+        const ssmClient = getRegionalSSMClient('us-east-1');
         const command = new GetParameterCommand({ Name: path, WithDecryption: isSecure });
         const response = await ssmClient.send(command);
         const value = response.Parameter?.Value;
+        
         if (value) {
             secretCache[path] = value;
             return value;
         }
     } catch (error: any) {
-        console.warn(`⚠️ SSM Bypass for ${path}: ${error.message}`);
-        // Do not crash. Return undefined so the app can try to survive.
+        console.warn(`⚠️ AWS SSM Fetch Failed for ${path}: ${error.message}`);
         return undefined;
     }
-    return undefined;
 };
-
-export async function getSecret(secretName: string): Promise<string | null> {
-    try {
-        const data = await secretsClient.send(new GetSecretValueCommand({ SecretId: secretName }));
-        if (data.SecretString) {
-            try {
-                const parsed = JSON.parse(data.SecretString);
-                return parsed.secretKey || parsed;
-            } catch {
-                return data.SecretString;
-            }
-        }
-        return null;
-    } catch (err) {
-        console.warn(`[AWS Config] Secret ${secretName} not found.`);
-        return null;
-    }
-}

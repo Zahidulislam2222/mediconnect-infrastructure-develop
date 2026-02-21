@@ -1,56 +1,41 @@
 import { Request, Response } from "express";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, QueryCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { v4 as uuidv4 } from "uuid";
-import { safeLog, safeError } from '../../../../shared/logger';
-
-const dbClient = new DynamoDBClient({ region: process.env.AWS_REGION || "us-east-1" });
-const docClient = DynamoDBDocumentClient.from(dbClient);
+import { QueryCommand } from "@aws-sdk/lib-dynamodb";
+// 🟢 ARCHITECTURE FIX: Use Shared Factory (Prevents Region Lock & Socket Exhaustion)
+import { getRegionalClient } from '../../config/aws';
+import { writeAuditLog } from '../../../../shared/audit';
 
 const TABLE_GRAPH = "mediconnect-graph-data";
-const AUDIT_TABLE = "mediconnect-audit-logs"; // 🟢 HIPAA Requirement
 
-/**
- * 🟢 HIPAA: Centralized Audit Logging
- */
-const writeAuditLog = async (actorId: string, patientId: string, action: string, details: string) => {
-    try {
-        await docClient.send(new PutCommand({
-            TableName: AUDIT_TABLE,
-            Item: {
-                logId: uuidv4(),
-                timestamp: new Date().toISOString(),
-                actorId,
-                patientId,
-                action,
-                details,
-                metadata: { platform: "MediConnect-v2", module: "Relationship-Graph" }
-            }
-        }));
-    } catch (e) { safeError("Audit Log Failed in Relationships", e); }
+// 🟢 COMPILER FIX: Safely extract region string
+const extractRegion = (req: Request): string => {
+    const rawRegion = req.headers['x-user-region'];
+    return Array.isArray(rawRegion) ? rawRegion[0] : (rawRegion || "us-east-1");
 };
 
 export const getRelationships = async (req: Request, res: Response) => {
     try {
         const authUser = (req as any).user;
+        
+        // 🟢 GDPR FIX: Define Regional Client based on user header
+        const userRegion = extractRegion(req);
+        const docClient = getRegionalClient(userRegion);
+
         let { entityId } = req.query as { entityId: string };
 
         if (!entityId) return res.status(400).json({ error: "Missing entityId" });
 
-        // 🟢 FIX: If the frontend sends just "PATIENT", rewrite it to the user's real ID
-        // This stops the 403 error and ensures they only see their own data.
+        // 🟢 UX FIX: Resolve "PATIENT" alias to the authenticated user's ID
         if (entityId === "PATIENT") {
             entityId = `PATIENT#${authUser.sub}`;
         }
 
-        const isDoctor = authUser['cognito:groups']?.some((g: string) => g.toLowerCase() === 'doctor');
+        const isDoctor = authUser['cognito:groups']?.some((g: string) => g.toLowerCase().includes('doctor'));
 
-        // 🟢 Security Check: Is the user a Doctor? OR are they asking for their own record?
+        // 🟢 SECURITY CHECK: IDOR Prevention
         const isSearchingOwnSelf = entityId === `PATIENT#${authUser.sub}`;
-
         if (!isDoctor && !isSearchingOwnSelf) {
-            safeError(`[SECURITY] Access Denied for ${authUser.sub} requesting ${entityId}`);
-            return res.status(403).json({ error: "Access Denied" });
+            await writeAuditLog(authUser.sub, entityId, "UNAUTHORIZED_GRAPH_ACCESS", "Blocked attempt to view another user's care network");
+            return res.status(403).json({ error: "Access Denied: You can only view your own care network." });
         }
 
         const command = new QueryCommand({
@@ -60,18 +45,58 @@ export const getRelationships = async (req: Request, res: Response) => {
         });
 
         const response = await docClient.send(command);
+        const rawItems = response.Items || [];
 
-        // HIPAA Audit Log
-        const logPatientId = entityId.includes('#') ? entityId.split('#')[1] : entityId;
-        await writeAuditLog(authUser.sub, logPatientId, "ACCESS_GRAPH", `Viewed ${response.Items?.length} connections`);
+        // 🟢 FHIR R4 MAPPING: Transform DynamoDB Graph -> FHIR CareTeam Resource
+        // This makes the data interoperable with hospital systems.
+        const fhirCareTeam = {
+            resourceType: "CareTeam",
+            id: entityId.replace('PATIENT#', ''),
+            status: "active",
+            subject: { 
+                reference: `Patient/${entityId.replace('PATIENT#', '')}`,
+                display: "Current Patient"
+            },
+            participant: rawItems.map((item: any) => ({
+                role: [{ 
+                    text: item.relationship || "Care Provider" 
+                }],
+                member: {
+                    // Extract ID from SK (e.g., "DOCTOR#123" -> "Practitioner/123")
+                    reference: item.SK.includes('DOCTOR#') 
+                        ? `Practitioner/${item.SK.replace('DOCTOR#', '')}` 
+                        : `RelatedPerson/${item.SK}`,
+                    display: item.doctorName || item.patientName || "Unknown Provider"
+                },
+                period: {
+                    start: item.createdAt || new Date().toISOString()
+                }
+            })),
+            meta: {
+                lastUpdated: new Date().toISOString(),
+                tag: [{ system: "https://mediconnect.com/region", code: userRegion }]
+            }
+        };
+
+        // HIPAA Audit Log (Using Shared Service)
+        const logTargetId = entityId.includes('#') ? entityId.split('#')[1] : entityId;
+        await writeAuditLog(
+            authUser.sub, 
+            logTargetId, 
+            "ACCESS_CARE_TEAM", 
+            `Viewed ${rawItems.length} members in Care Team`
+        );
 
         res.json({
-            connections: response.Items || [],
+            // Return standard FHIR resource
+            resource: fhirCareTeam,
+            // Keep legacy array for current frontend compatibility if needed
+            connections: rawItems, 
             timestamp: new Date().toISOString()
         });
 
     } catch (error: any) {
-        safeError("Relationship Graph Error:", error);
+        console.error("Relationship Graph Error:", error);
         res.status(500).json({ error: "Failed to load care network" });
     }
 };

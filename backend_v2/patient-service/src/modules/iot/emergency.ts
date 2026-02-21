@@ -1,85 +1,86 @@
 import { Request, Response } from "express";
-import { docClient } from "../../config/aws";
+import { getRegionalClient, getRegionalSNSClient } from "../../config/aws"; 
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
-import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
+import { PublishCommand } from "@aws-sdk/client-sns";
 import { v4 as uuidv4 } from "uuid";
 
-// 🟢 CONFIG: Load Region from Env
 const REGION = process.env.AWS_REGION || "us-east-1";
-const snsClient = new SNSClient({ region: REGION });
 
 const TABLE_APPOINTMENTS = process.env.DYNAMO_TABLE_APPOINTMENTS || "mediconnect-appointments";
-// 🟢 SECURITY: Remove Hardcoded Account ID
-const SNS_TOPIC_ARN = process.env.SNS_TOPIC_ARN;
+const SNS_TOPIC_ARN_US = process.env.SNS_TOPIC_ARN_US;
+const SNS_TOPIC_ARN_EU = process.env.SNS_TOPIC_ARN_EU;
 
+/**
+ * 🟢 SHARED LOGIC: handleEmergencyDetection
+ * Used by BOTH the HTTP API and the MQTT IoT Bridge.
+ */
+export const handleEmergencyDetection = async (patientId: string, heartRate: number, type: string, region: string = "us-east-1") => {
+    // 🚨 THRESHOLD: 150 BPM for Automated, 100 BPM for Manual/General
+    const isCritical = heartRate > 150 || type === 'MANUAL_OVERRIDE';
+    
+    if (isCritical) {
+        const appointmentId = uuidv4();
+        const now = new Date().toISOString();
+        const message = type === 'MANUAL_OVERRIDE'
+            ? `⚠️ MANUAL PANIC: Patient ${patientId} pressed the button.`
+            : `🚨 CRITICAL AUTO-ALERT: Patient ${patientId} Heart Rate at ${heartRate} BPM! (Threshold 150)`;
+
+        const dynamicDb = getRegionalClient(region);
+
+        // 1. Create Emergency Record in DynamoDB
+        await dynamicDb.send(new PutCommand({
+            TableName: TABLE_APPOINTMENTS,
+            Item: {
+                appointmentId,
+                patientId,
+                doctorId: "ON-CALL-ER-DOC",
+                status: "URGENT",
+                type: type.startsWith('EMERGENCY') ? type : `EMERGENCY_IOT`,
+                startTime: now,
+                notes: message,
+                createdAt: now,
+                resource: { resourceType: "Appointment", id: appointmentId, status: "proposed", description: message },
+                region
+            }
+        }));
+
+        // 2. Dispatch AWS SNS (SMS/Email)
+         const regionalSNS = getRegionalSNSClient(region);
+        const targetTopic = region.toUpperCase() === 'EU' ? SNS_TOPIC_ARN_EU : SNS_TOPIC_ARN_US;
+
+        if (targetTopic) {
+            await regionalSNS.send(new PublishCommand({
+                TopicArn: targetTopic,
+                Message: message,
+                Subject: `MEDICONNECT EMERGENCY [${region.toUpperCase()}]`
+            }));
+        } else {
+            console.warn(`⚠️ No SNS Topic configured for region: ${region}`);
+        }
+        
+        console.log(`[AUDIT] Emergency Processed for ${patientId} in ${region}`);
+        return { success: true, appointmentId };
+    }
+    return { success: false, message: "Vitals within normal range." };
+};
+
+/**
+ * Express Controller for manual triggers
+ */
 export const triggerEmergency = async (req: Request, res: Response) => {
     try {
         const { patientId, heartRate, type } = req.body;
-        const requesterId = (req as any).user?.id;
-        const requesterRole = (req as any).user?.role; // 🟢 Get role from token
-
-        // 🟢 SECURITY: IDOR PROTECTION (Expanded for Medical Staff)
-        // Allow if: 1. Patient is saving themselves OR 2. A Doctor/Provider is saving a patient
-        const isAuthorized = (patientId === requesterId) || (requesterRole === 'doctor' || requesterRole === 'provider');
-
-        if (!patientId || !isAuthorized) {
-            console.warn(`[SECURITY] Blocked: ${requesterId} (${requesterRole}) tried to trigger emergency for ${patientId}`);
-            return res.status(403).json({ error: "Unauthorized: You do not have permission to trigger an alert for this patient." });
+        const user = (req as any).user;
+        
+        // Security Check
+        if (patientId !== user.id && user.role !== 'doctor') {
+            return res.status(403).json({ error: "Unauthorized" });
         }
 
-        if (!SNS_TOPIC_ARN) {
-            console.error("CRITICAL: SNS_TOPIC_ARN not set in environment");
-            return res.status(500).json({ error: "System Configuration Error" });
-        }
-
-        // Logic: Trigger if Heart Rate > 100 OR Manual Override
-        if (Number(heartRate) > 100 || type === 'MANUAL_OVERRIDE') {
-            const appointmentId = uuidv4();
-            const now = new Date().toISOString();
-
-            const message = type === 'MANUAL_OVERRIDE'
-                ? `⚠️ MANUAL PANIC BUTTON PRESSED by Patient ${patientId}`
-                : `CRITICAL ALERT: Patient ${patientId} Heart Rate ${heartRate} bpm.`;
-
-            // 1. Create Emergency Appointment (Distributed Monolith Pattern - Direct Write)
-            // Note: Ideally this should call Booking Service, but for Zero-Cost/Hotfix we write direct.
-            await docClient.send(new PutCommand({
-                TableName: TABLE_APPOINTMENTS,
-                Item: {
-                    appointmentId,
-                    patientId,
-                    doctorId: "ON-CALL-ER-DOC",
-                    status: "URGENT",
-                    type: type === 'MANUAL_OVERRIDE' ? "EMERGENCY_MANUAL" : "EMERGENCY_AUTOMATED",
-                    startTime: now,
-                    notes: message,
-                    createdAt: now,
-                    updatedAt: now,
-                    paymentStatus: "WAIVED" // Emergency is free/billed later
-                }
-            }));
-
-            // 2. Dispatch SNS Alert
-            await snsClient.send(new PublishCommand({
-                TopicArn: SNS_TOPIC_ARN,
-                Message: message,
-                Subject: `MEDICONNECT EMERGENCY: ${patientId}`
-            }));
-
-            // 🟢 AUDIT: Log this critical event
-            console.log(`[AUDIT] Emergency triggered for ${patientId} (Type: ${type})`);
-
-            return res.status(201).json({
-                success: true,
-                appointmentId,
-                message: "Emergency services dispatched. Support team notified."
-            });
-        }
-
-        res.json({ message: "Vitals normal. No emergency triggered." });
+        const result = await handleEmergencyDetection(patientId, Number(heartRate), type || 'MANUAL_OVERRIDE', user.region);
+        return res.status(result.success ? 201 : 200).json(result);
 
     } catch (error: any) {
-        console.error("🚨 Emergency Handler Error:", error.message);
-        res.status(500).json({ error: "Emergency Dispatch Failed", details: error.message });
+        res.status(500).json({ error: "Dispatch Failed", details: error.message });
     }
 };

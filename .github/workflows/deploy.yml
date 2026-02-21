@@ -1,0 +1,82 @@
+name: 🚀 Global Multi-Cloud Deploy (Doctor Service)
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'backend_v2/doctor-service/**'
+      - 'backend_v2/shared/**'
+
+permissions:
+  id-token: write # Required for GCP Workload Identity Federation
+  contents: read
+
+env:
+  AZURE_CONTAINER_REGISTRY: "zahidmediconnectacr"
+  AZURE_RESOURCE_GROUP: "mediconnect-rg"
+  GCP_PROJECT_ID: "mediconnect-analytics"
+  GCP_WORKLOAD_IDENTITY_PROVIDER: "projects/123456789/locations/global/workloadIdentityPools/github-pool/providers/github-provider" # You need to set this up in GCP
+  GCP_SERVICE_ACCOUNT: "github-deployer@mediconnect-analytics.iam.gserviceaccount.com"
+
+jobs:
+  # =========================================================
+  # JOB 1: DEPLOY TO AZURE (US Region - HIPAA)
+  # =========================================================
+  deploy-azure-us:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }} # JSON from `az ad sp create-for-rbac`
+
+      - name: Login to ACR
+        run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
+
+      - name: Build and Push Docker Image
+        run: |
+          # We use the script but override the manual login parts
+          chmod +x deploy_doctor_global.sh
+          # Note: We manually run the build/push here to ensure context is correct
+          docker build -t ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }} -f backend_v2/doctor-service/Dockerfile backend_v2
+          docker push ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}
+
+      - name: Deploy to Azure Container Apps
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          appSourcePath: ${{ github.workspace }}/backend_v2
+          acrName: ${{ env.AZURE_CONTAINER_REGISTRY }}
+          containerAppName: doctor-service
+          resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
+          imageToDeploy: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}
+          environmentVariables: |
+            NODE_ENV=production
+            AWS_REGION=us-east-1
+
+  # =========================================================
+  # JOB 2: DEPLOY TO GCP (EU Region - GDPR)
+  # =========================================================
+  deploy-gcp-eu:
+    runs-on: ubuntu-latest
+    needs: deploy-azure-us # Optional: Run sequentially or parallel
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build & Deploy to Cloud Run (EU)
+        run: |
+          chmod +x deploy_gcp.sh
+          # We execute your script, targeting 'eu'
+          ./deploy_gcp.sh eu

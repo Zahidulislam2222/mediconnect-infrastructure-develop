@@ -1,62 +1,93 @@
-import { KMSClient, VerifyCommand } from "@aws-sdk/client-kms";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { VerifyCommand } from "@aws-sdk/client-kms";
+import { GetCommand } from "@aws-sdk/lib-dynamodb";
+// 🟢 ARCHITECTURE FIX: Use Shared Factories to support US and EU audits
+import { getRegionalClient, getRegionalKMSClient } from "../config/aws";
+import { writeAuditLog } from "../../../shared/audit";
 
-async function runPerfectAudit() {
-    const region = process.env.AWS_REGION || "us-east-1";
+/**
+ * runPerfectAudit - Clinical Integrity Verifier
+ * 🟢 GDPR FIX: Now accepts 'region' to prevent US-EU data leakage.
+ */
+async function runPerfectAudit(prescriptionId: string, region: string = "us-east-1") {
+    
+    // 1. Initialize Regional Infrastructure
+    const docClient = getRegionalClient(region);
+    const kmsClient = getRegionalKMSClient(region);
 
-    // 🟢 FIX: No hardcoded credentials. The SDK automatically picks up 
-    // AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from your .env file.
-    const ddbClient = new DynamoDBClient({ region });
-    const docClient = DynamoDBDocumentClient.from(ddbClient);
-    const kmsClient = new KMSClient({ region });
+    console.log(`🔍 [AUDIT][${region.toUpperCase()}] Fetching Prescription: ${prescriptionId}`);
 
-    const targetId = "d17c2fb3-022b..."; // Keep your target ID
-
-    console.log("🔍 Step 1: Fetching...");
+    // 2. Fetch the Clinical Record
     const result = await docClient.send(new GetCommand({
         TableName: "mediconnect-prescriptions",
-        Key: { prescriptionId: targetId }
+        Key: { prescriptionId }
     }));
 
     const item = result.Item;
     if (!item) {
-        console.error("❌ Error: Prescription not found");
+        console.error("❌ Error: Prescription record not found in this region.");
         return;
     }
 
-    const originalDataToVerify = {
+    /**
+     * 🟢 FHIR INTEGRITY FIX: 
+     * We verify the 'resource' object itself. This ensures that the medical data 
+     * shared with hospitals is exactly what the doctor signed.
+     */
+    const dataToVerify = JSON.stringify(item.resource || {
         prescriptionId: item.prescriptionId,
         patientName: item.patientName,
         doctorName: item.doctorName,
         medication: item.medication,
         dosage: item.dosage,
         instructions: item.instructions,
-        timestamp: item.timestamp,
-        price: item.price,
-        refillsRemaining: item.refillsRemaining,
-        paymentStatus: "UNPAID" 
-    };
+        timestamp: item.timestamp
+    });
 
-    console.log("🔒 Step 2: Sending to KMS...");
+    console.log("🔒 Step 2: Validating Digital Signature via Regional KMS...");
+
+    // 3. Perform Cryptographic Verification
     const command = new VerifyCommand({
-        // 🟢 FIX: Using Key ID from Environment Variables
         KeyId: process.env.KMS_KEY_ID, 
-        Message: Buffer.from(JSON.stringify(originalDataToVerify)),
+        Message: Buffer.from(dataToVerify),
         MessageType: "RAW",
-        Signature: Buffer.from(item.digitalSignature, "base64"),
-        SigningAlgorithm: "RSASSA_PSS_SHA_256",
+        Signature: Buffer.from(item.signature, "base64"),
+        // 🟢 ALGORITHM FIX: Must match 'RSASSA_PKCS1_V1_5_SHA_256' used in PDF Generator
+        SigningAlgorithm: "RSASSA_PKCS1_V1_5_SHA_256",
     });
 
     try {
         const response = await kmsClient.send(command);
+        
         if (response.SignatureValid) {
-            console.log("✅ [LEGAL AUDIT PASSED]");
-            console.log("Identity and Integrity Verified.");
+            console.log("✅ [LEGAL AUDIT PASSED]: Identity and Integrity 100% Verified.");
+
+            // 🟢 HIPAA FIX: Record the Audit Action
+            await writeAuditLog(
+                "SYSTEM_AUDITOR", 
+                item.patientId, 
+                "INTEGRITY_VERIFICATION_SUCCESS", 
+                `Verified clinical signature for Rx: ${prescriptionId}`,
+                { region }
+            );
+        } else {
+            console.error("🚨 [SECURITY ALERT]: Signature is INVALID. Data may have been tampered with.");
         }
     } catch (e: any) {
         console.error("❌ [AUDIT FAILED]:", e.message);
+        
+        // Log the failure for HIPAA investigation
+        await writeAuditLog(
+            "SYSTEM_AUDITOR", 
+            item.patientId || "UNKNOWN", 
+            "INTEGRITY_VERIFICATION_FAILURE", 
+            `Verification failed for Rx: ${prescriptionId}. Error: ${e.message}`,
+            { region }
+        );
     }
 }
 
-runPerfectAudit();
+// Example usage for an EU prescription
+// runPerfectAudit("d17c2fb3-022b...", "EU");
+// Default usage for US
+const targetId = process.env.AUDIT_TARGET_ID || "d17c2fb3-022b..."; 
+runPerfectAudit(targetId, "US");

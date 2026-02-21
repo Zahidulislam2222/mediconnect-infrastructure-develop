@@ -1,80 +1,91 @@
 import { Request, Response } from "express";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, QueryCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { query } from '../../config/db';
-import { safeLog, safeError } from '../../../../shared/logger';
+import { PutCommand, QueryCommand, GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 
-const s3Client = new S3Client({ region: "us-east-1" });
-const BUCKET_NAME = process.env.EHR_BUCKET || "mediconnect-ehr-records";
+// 🟢 ARCHITECTURE FIX: Import Shared Factories (Prevents Socket Exhaustion)
+import { getRegionalClient, getRegionalS3Client } from '../../config/aws'; 
+import { writeAuditLog } from '../../../../shared/audit';
 
-const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({ region: "us-east-1" }));
 const TABLE_EHR = "mediconnect-health-records";
-const AUDIT_TABLE = "mediconnect-audit-logs";
 
-// 🟢 HIPAA: Centralized Audit Logging function
-const writeAuditLog = async (actorId: string, patientId: string, action: string, details: string) => {
-    try {
-        await docClient.send(new PutCommand({
-            TableName: AUDIT_TABLE,
-            Item: {
-                logId: uuidv4(),
-                timestamp: new Date().toISOString(),
-                actorId,
-                patientId,
-                action,
-                details,
-                metadata: { platform: "MediConnect-v2", security: "High" }
-            }
-        }));
-    } catch (e) { console.error("Audit Log Failed", e); }
+// 🟢 COMPILER FIX: Safely extract region string
+const extractRegion = (req: Request): string => {
+    const rawRegion = req.headers['x-user-region'];
+    return Array.isArray(rawRegion) ? rawRegion[0] : (rawRegion || "us-east-1");
 };
 
-// 🟢 RESTORED Standalone Export for Routes
+// Helper: Resolve Bucket Name based on Region
+const getBucketName = (region: string) => {
+    return region.toUpperCase().includes('EU') 
+        ? (process.env.EHR_BUCKET_EU || "mediconnect-ehr-records-eu")
+        : (process.env.EHR_BUCKET_US || "mediconnect-ehr-records");
+};
+
 export const getUploadUrl = async (req: Request, res: Response) => {
     const { fileName, fileType, patientId } = req.body;
     const authUser = (req as any).user;
+    
+    // 🟢 GDPR/INFRA FIX: Use Shared Cached Client
+    const userRegion = extractRegion(req);
+    const s3Client = getRegionalS3Client(userRegion);
+    const bucketName = getBucketName(userRegion);
 
     if (!fileName || !patientId) return res.status(400).json({ error: "Missing fields" });
+
+    // 🟢 HIPAA SECURITY FIX: IDOR Prevention
+    const isDoctor = authUser['cognito:groups']?.some((g: string) => ['doctor', 'doctors'].includes(g.toLowerCase()));
+    if (authUser.sub !== patientId && !isDoctor) {
+        await writeAuditLog(authUser.sub, patientId, "UNAUTHORIZED_UPLOAD_ATTEMPT", "Blocked attempt to upload to another patient's folder");
+        return res.status(403).json({ error: "HIPAA Violation: Unauthorized upload attempt." });
+    }
 
     const s3Key = `${patientId}/${uuidv4()}-${fileName}`;
 
     try {
         const command = new PutObjectCommand({
-            Bucket: BUCKET_NAME,
+            Bucket: bucketName,
             Key: s3Key,
             ContentType: fileType
         });
         const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 300 });
 
-        // HIPAA Log
         await writeAuditLog(authUser.sub, patientId, "REQUEST_UPLOAD_URL", `File: ${fileName}`);
-
         res.json({ uploadUrl, s3Key });
     } catch (error: any) {
         res.status(500).json({ error: error.message });
     }
 };
 
-// 🟢 RESTORED Standalone Export for Routes
 export const getViewUrl = async (req: Request, res: Response) => {
     const { s3Key } = req.body;
     const authUser = (req as any).user;
+    
+    // 🟢 GDPR/INFRA FIX: Use Shared Cached Client
+    const userRegion = extractRegion(req);
+    const s3Client = getRegionalS3Client(userRegion);
+    const bucketName = getBucketName(userRegion);
 
     if (!s3Key) return res.status(400).json({ error: "s3Key required" });
 
+    // 🟢 HIPAA SECURITY FIX: IDOR Prevention
+    const targetPatientId = s3Key.split('/')[0];
+    const isDoctor = authUser['cognito:groups']?.some((g: string) => ['doctor', 'doctors'].includes(g.toLowerCase()));
+    
+    if (authUser.sub !== targetPatientId && !isDoctor) {
+        await writeAuditLog(authUser.sub, targetPatientId, "UNAUTHORIZED_VIEW_ATTEMPT", "Blocked attempt to view another patient's file");
+        return res.status(403).json({ error: "HIPAA Violation: Unauthorized view attempt." });
+    }
+
     try {
         const command = new GetObjectCommand({
-            Bucket: BUCKET_NAME,
+            Bucket: bucketName,
             Key: s3Key
         });
         const viewUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
 
-        // HIPAA Log
-        await writeAuditLog(authUser.sub, s3Key.split('/')[0], "GET_VIEW_URL", `Key: ${s3Key}`);
-
+        await writeAuditLog(authUser.sub, targetPatientId, "GET_VIEW_URL", `Key: ${s3Key}`);
         res.json({ viewUrl });
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -84,16 +95,33 @@ export const getViewUrl = async (req: Request, res: Response) => {
 export const handleEhrAction = async (req: Request, res: Response) => {
     const { action, patientId } = req.body;
     const authUser = (req as any).user;
+    
+    // 🟢 INFRA FIX: Use Shared Cached Factories
+    const userRegion = extractRegion(req);
+    const regionalDb = getRegionalClient(userRegion);
+    const s3Client = getRegionalS3Client(userRegion);
+    const bucketName = getBucketName(userRegion);
 
-    // 1. SECURITY: Determine Roles
     let isDoctor = authUser['cognito:groups']?.some((g: string) => ['doctor', 'doctors'].includes(g.toLowerCase()));
+    
     if (!isDoctor) {
-        const docCheck = await query('SELECT 1 FROM doctors WHERE id = $1', [authUser.sub]);
-        if (docCheck.rows.length > 0) isDoctor = true;
+        try {
+            const docCheck = await regionalDb.send(new GetCommand({
+                TableName: "mediconnect-doctors",
+                Key: { doctorId: authUser.sub }
+            }));
+            if (docCheck.Item) isDoctor = true;
+        } catch (e) { 
+            console.error("Doctor Check Failed", e); 
+        }
     }
+    
     const isOwner = authUser.sub === patientId;
 
-    if (!isDoctor && !isOwner) return res.status(403).json({ error: "Access Denied" });
+    if (!isDoctor && !isOwner) {
+        await writeAuditLog(authUser.sub, patientId, "UNAUTHORIZED_EHR_ACCESS", "Blocked attempt to access EHR");
+        return res.status(403).json({ error: "Access Denied" });
+    }
 
     try {
         switch (action) {
@@ -101,16 +129,18 @@ export const handleEhrAction = async (req: Request, res: Response) => {
                 const listCmd = new QueryCommand({
                     TableName: TABLE_EHR,
                     KeyConditionExpression: "patientId = :pid",
-                    ExpressionAttributeValues: { ":pid": patientId }
+                    FilterExpression: "isDeleted <> :true", // 🟢 GDPR: Hide deleted records
+                    ExpressionAttributeValues: { ":pid": patientId, ":true": true }
                 });
-                const result = await docClient.send(listCmd);
+                
+                const result = await regionalDb.send(listCmd);
                 const items = result.Items || [];
 
-                const processedItems = await Promise.all(items.map(async (item) => {
+                const processedItems = await Promise.all(items.map(async (item: any) => {
                     if (item.type === 'NOTE' || !item.s3Key) return item;
                     try {
                         const s3Url = await getSignedUrl(s3Client, new GetObjectCommand({
-                            Bucket: BUCKET_NAME, Key: item.s3Key
+                            Bucket: bucketName, Key: item.s3Key
                         }), { expiresIn: 900 });
                         return { ...item, s3Url };
                     } catch (e) { return { ...item, error: "Link expired" }; }
@@ -123,50 +153,30 @@ export const handleEhrAction = async (req: Request, res: Response) => {
                 const { note, title, fileName } = req.body;
                 const noteId = uuidv4();
 
-                // 🟢 ADVANCED FHIR R4: ClinicalImpression (Now matches your professional blueprint)
-                const fhirResource = {
+                const fhirImpression = {
                     resourceType: "ClinicalImpression",
                     id: noteId,
                     status: "completed",
                     code: {
-                        coding: [
-                            {
-                                system: "http://loinc.org",
-                                code: "11450-4",
-                                display: "Problem list - Reported"
-                            }
-                        ],
+                        coding: [{ system: "http://loinc.org", code: "11450-4", display: "Problem list - Reported" }],
                         text: title || "General Clinical Note"
                     },
                     subject: { reference: `Patient/${patientId}` },
                     assessor: { reference: `Practitioner/${authUser.sub}` },
                     date: new Date().toISOString(),
                     summary: note,
-                    description: fileName || title || "Clinical Consultation",
                     meta: {
-                        versionId: "1",
-                        lastUpdated: new Date().toISOString(),
-                        security: [
-                            { system: "http://terminology.hl7.org/CodeSystem/v3-Confidentiality", code: "R", display: "restricted" }
-                        ],
-                        tag: [
-                            { system: "https://mediconnect.com/privacy", code: "GDPR-LOCKED" }
-                        ]
+                        versionId: "1", lastUpdated: new Date().toISOString(),
+                        security: [{ system: "http://terminology.hl7.org/CodeSystem/v3-Confidentiality", code: "R", display: "restricted" }]
                     }
                 };
 
-                // 🏗️ STAYING ON AWS: Using docClient and PutCommand
-                await docClient.send(new PutCommand({
+                await regionalDb.send(new PutCommand({
                     TableName: TABLE_EHR,
                     Item: {
-                        patientId,           // Root Key
-                        recordId: noteId,    // Range Key
-                        type: 'NOTE',
-                        summary: note,       // Legacy field for Frontend
-                        title: title || "Clinical Note",
-                        isLocked: true,      // HIPAA Immutability
-                        resource: fhirResource, // Advanced FHIR JSON
-                        createdAt: new Date().toISOString()
+                        patientId, recordId: noteId, type: 'NOTE', summary: note,       
+                        title: title || "Clinical Note", isLocked: true,      
+                        resource: fhirImpression, createdAt: new Date().toISOString()
                     }
                 }));
 
@@ -176,18 +186,56 @@ export const handleEhrAction = async (req: Request, res: Response) => {
             case "save_record_metadata":
                 const { fileName: fName, fileType, s3Key, description } = req.body;
                 const recordId = uuidv4();
-                await docClient.send(new PutCommand({
+                
+                // 🟢 FHIR R4: DocumentReference
+                const fhirDocument = {
+                    resourceType: "DocumentReference",
+                    id: recordId,
+                    status: "current",
+                    subject: { reference: `Patient/${patientId}` },
+                    author: [{ reference: `Practitioner/${authUser.sub}` }],
+                    description: description || fName,
+                    content: [{
+                        attachment: { contentType: fileType, url: s3Key, title: fName }
+                    }],
+                    date: new Date().toISOString()
+                };
+
+                await regionalDb.send(new PutCommand({
                     TableName: TABLE_EHR,
                     Item: {
-                        patientId, recordId,
-                        fileName: fName, fileType, s3Key,
+                        patientId, recordId, fileName: fName, fileType, s3Key,
                         description: description || "Medical Upload",
                         uploadedBy: authUser.sub,
+                        resource: fhirDocument, 
                         createdAt: new Date().toISOString()
                     }
                 }));
-                await writeAuditLog(authUser.sub, patientId, "UPLOAD_FILE", `File: ${fName}`);
+
+                await writeAuditLog(authUser.sub, patientId, "UPLOAD_FILE", `File: ${fName} saved as DocumentReference`);
                 return res.json({ success: true, recordId });
+
+            // 🟢 GDPR FIX: Right to Erasure (Soft Delete)
+            // Allows patient to 'delete' view, but maintains HIPAA retention in backend
+            case "delete_record":
+                const { recordIdToDelete } = req.body;
+                if (!recordIdToDelete) return res.status(400).json({ error: "Missing recordId" });
+                
+                if (!isOwner && !isDoctor) return res.status(403).json({ error: "Unauthorized" });
+
+                await regionalDb.send(new UpdateCommand({
+                    TableName: TABLE_EHR,
+                    Key: { patientId, recordId: recordIdToDelete },
+                    UpdateExpression: "SET isDeleted = :true, deletedAt = :now, deletedBy = :who",
+                    ExpressionAttributeValues: {
+                        ":true": true,
+                        ":now": new Date().toISOString(),
+                        ":who": authUser.sub
+                    }
+                }));
+
+                await writeAuditLog(authUser.sub, patientId, "DELETE_RECORD", `Soft deleted record ${recordIdToDelete} (GDPR/HIPAA Retention)`);
+                return res.json({ success: true, message: "Record removed from view." });
 
             case "request_upload":
                 return getUploadUrl(req, res);

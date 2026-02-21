@@ -5,13 +5,24 @@ import morgan from 'morgan';
 import dotenv from 'dotenv';
 import doctorRoutes from './routes/doctor.routes';
 import clinicalRoutes from "./modules/clinical/clinical.routes";
-import { initDb } from './config/db';
-import { SSMClient, GetParametersCommand } from "@aws-sdk/client-ssm";
+import rateLimit from 'express-rate-limit';
+
+import { GetParametersCommand } from "@aws-sdk/client-ssm";
 import { safeLog, safeError } from '../../shared/logger';
+// 🟢 ARCHITECTURE FIX: Use Shared Factory for Regional Secret Loading
+import { getRegionalSSMClient } from './config/aws';
 
 dotenv.config();
 
 const app = express();
+
+// 🟢 SECURITY: DDoS Protection (100 requests / 15 mins)
+const globalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, 
+    max: 100, 
+    message: { error: "Too many requests. Please try again later." }
+});
+app.use(globalLimiter);
 const PORT = process.env.PORT || 8082;
 
 // --- 1. COMPLIANT CORS (HIPAA/GDPR) ---
@@ -43,15 +54,21 @@ app.use(cors({
     origin: allowedOrigins,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    // Added 'Prefer' and 'If-Match' for FHIR standard compatibility
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Internal-Secret', 'X-User-ID', 'Prefer', 'If-Match']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Internal-Secret', 'X-User-ID', 'Prefer', 'If-Match', 'x-user-region']
 }));
 app.options('*', cors());
 
 // HIPAA Requirement: Limit payload size to prevent DoS
 app.use(express.json({ limit: '2mb' }));
 
-// HIPAA/GDPR Audit Logging: Capture User Context
+/**
+ * 🟢 HIPAA AUDIT FIX: Secure Identity Logging
+ * We no longer trust 'req.headers'. We check 'req.user' which comes from the Verified Token.
+ */
+morgan.token('verified-user', (req: any) => {
+    return req.user?.sub ? `User:${req.user.sub}` : 'Unauthenticated';
+});
+
 app.use(morgan((tokens, req, res) => {
     return [
         `[AUDIT]`,
@@ -59,8 +76,8 @@ app.use(morgan((tokens, req, res) => {
         tokens.url(req, res),
         tokens.status(req, res),
         tokens['response-time'](req, res), 'ms',
-        `User: ${req.headers['x-user-id'] || 'anonymous'}`,
-        `IP: ${req.ip}`
+        tokens['verified-user'](req, res), // 🟢 The Fix
+        `IP:${req.ip}`
     ].join(' ');
 }, {
     skip: (req) => req.method === 'OPTIONS'
@@ -81,66 +98,66 @@ app.use('/', clinicalRoutes);
 
 // --- 4. SECRETS LOADER (Resilient Architecture) ---
 async function loadSecrets() {
-    // DIAGNOSTIC LOG (Masked for Security)
-    const keyHint = process.env.AWS_ACCESS_KEY_ID ? `${process.env.AWS_ACCESS_KEY_ID.substring(0, 8)}...` : 'MISSING';
-    console.log(`🔎 Boot Check: AWS ID [${keyHint}] in [${process.env.AWS_REGION || 'us-east-1'}]`);
-
-    // If no credentials at all, don't even try SSM (avoid timeout)
-    if (!process.env.AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID.includes('PLACEHOLDER')) {
-        console.warn("⚠️ No AWS Credentials found. Relying on Azure Portal Environment Variables.");
-        return;
-    }
-
-    const ssm = new SSMClient({ 
-        region: process.env.AWS_REGION || 'us-east-1',
-        // Hard limit: If AWS doesn't respond in 2s, we proceed with Azure values
-        requestHandler: { connectionTimeout: 2000 }
-    });
+    // Determine Region from Env (Default US)
+    const region = process.env.AWS_REGION || 'us-east-1';
+    
+    // 🟢 INFRA FIX: Use Regional Factory (Prevents Cross-Region Dependency)
+    const ssm = getRegionalSSMClient(region);
 
     try {
-        console.log("🔐 Synchronizing secrets with AWS Vault...");
+        console.log(`🔐 Synchronizing secrets with AWS Vault [${region}]...`);
         const command = new GetParametersCommand({
             Names: [
                 '/mediconnect/prod/kms/signing_key_id',
+                // US Identity
                 '/mediconnect/prod/cognito/client_id',
                 '/mediconnect/prod/cognito/user_pool_id',
-                '/mediconnect/prod/gcp/sql/public_ip',
-                '/mediconnect/prod/gcp/sql/db_user',
-                '/mediconnect/prod/db/master_password'
+                // EU Identity (GDPR)
+                '/mediconnect/prod/cognito/user_pool_id_eu',
+                // Shared Infrastructure
+                '/mediconnect/prod/db/dynamo_table'
             ],
             WithDecryption: true
         });
 
         const { Parameters } = await ssm.send(command);
 
-        Parameters?.forEach(p => {
-            // PROFESSIONAL LOGIC: Do not overwrite if Azure Portal already has a value
-            if (p.Name === '/mediconnect/prod/kms/signing_key_id' && !process.env.KMS_KEY_ID) process.env.KMS_KEY_ID = p.Value;
-            if (p.Name === '/mediconnect/prod/cognito/client_id' && !process.env.COGNITO_CLIENT_ID) process.env.COGNITO_CLIENT_ID = p.Value;
-            if (p.Name === '/mediconnect/prod/cognito/user_pool_id' && !process.env.COGNITO_USER_POOL_ID) process.env.COGNITO_USER_POOL_ID = p.Value;
-            if (p.Name === '/mediconnect/prod/gcp/sql/public_ip' && !process.env.DB_HOST) process.env.DB_HOST = p.Value;
-            if (p.Name === '/mediconnect/prod/gcp/sql/db_user' && !process.env.DB_USER) process.env.DB_USER = p.Value;
-            if (p.Name === '/mediconnect/prod/db/master_password' && !process.env.DB_PASSWORD) process.env.DB_PASSWORD = p.Value;
+        if (!Parameters || Parameters.length === 0) {
+            throw new Error("No secrets found in Parameter Store.");
+        }
+
+        Parameters?.forEach((p: any) => {
+    if (p.Name && p.Name.includes('kms/signing_key_id')) process.env.KMS_KEY_ID = p.Value;
+            
+            // Map US
+            if (p.Name === '/mediconnect/prod/cognito/client_id') process.env.COGNITO_CLIENT_ID = p.Value;
+            if (p.Name === '/mediconnect/prod/cognito/user_pool_id') process.env.COGNITO_USER_POOL_ID = p.Value;
+            
+            // Map EU
+            if (p.Name === '/mediconnect/prod/cognito/user_pool_id_eu') process.env.COGNITO_USER_POOL_ID_EU = p.Value;
         });
         console.log("✅ AWS Vault Sync Complete.");
     } catch (e: any) {
-        // HIPAA COMPLIANCE: Fail Open on vault access, Fail Closed on DB access.
-        // We log the error but do NOT crash. The initDb() function will catch issues later.
-        console.warn(`⚠️ Vault Sync Bypass: ${e.message}. Using System Environment Variables.`);
+        // 🟢 HIPAA AVAILABILITY FIX: Fail Fast
+        // If we cannot load secrets, we MUST crash. A zombie server is dangerous.
+        safeError(`❌ FATAL: Vault Sync Failed. System cannot start securely.`, e.message);
+        process.exit(1); 
     }
 }
 
 // --- 5. START SERVER ---
 const startServer = async () => {
     try {
+        // 1. Load Secrets (Blocking Operation)
         await loadSecrets();
-        await initDb(); 
+
+        // 2. Start Listener
         app.listen(Number(PORT), '0.0.0.0', () => {
             safeLog(`🚀 Doctor Service Production Ready on port ${PORT} `);
         });
     } catch (error: any) {
         safeError('❌ FATAL: Application failed to start:', error.message);
-        process.exit(1); // Standard Unix exit code for failure
+        process.exit(1); 
     }
 };
 

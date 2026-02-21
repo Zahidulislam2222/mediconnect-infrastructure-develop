@@ -1,6 +1,6 @@
 import { Router } from 'express';
-// 🟢 CORRECT: Using the authenticated client from aws.ts
-import { dbClient } from '../config/aws'; 
+import { getRegionalClient } from '../config/aws'; 
+import { ScanCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import {
     createPatient,
     getDemographics,
@@ -8,12 +8,10 @@ import {
     updateProfile,
     verifyIdentity,
     deleteProfile,
-    getPatientById
+    getPatientById,
+    searchPatients
 } from '../controllers/patient.controller';
 import { authMiddleware } from '../middleware/auth.middleware';
-// 🟢 REMOVED: 'DynamoDBClient' class import is no longer needed here
-import { ScanCommand, GetItemCommand } from "@aws-sdk/client-dynamodb"; 
-import { unmarshall } from "@aws-sdk/util-dynamodb";
 import { writeAuditLog } from '../../../shared/audit';
 
 // ==========================================
@@ -23,15 +21,16 @@ import { writeAuditLog } from '../../../shared/audit';
 export const getPublicKnowledge = async (req: any, res: any) => {
     try {
         const tableName = "mediconnect-knowledge-base";
-        const params = { TableName: tableName };
+        const userRegion = req.headers['x-user-region'] || "us-east-1"; // 🟢 Detect Region
+        const dynamicDb = getRegionalClient(userRegion); // 🟢 Use Local DB
         
-        // 🟢 FIX: Used 'dbClient' instead of 'dynamo'
-        const { Items } = await dbClient.send(new ScanCommand(params));
+        const params = { TableName: tableName };
+        const { Items } = await dynamicDb.send(new ScanCommand(params));
         
         if (!Items || Items.length === 0) return res.json([]);
 
-        const fhirArticles = Items.map((item: any) => {
-            const art = unmarshall(item);
+        // 🟢 FIX: DocumentClient auto-unmarshalls, so we don't need 'unmarshall(item)'
+        const fhirArticles = Items.map((art: any) => {
             return {
                 id: art.topic || art.id,
                 resourceType: "DocumentReference",
@@ -50,13 +49,14 @@ export const getPublicKnowledge = async (req: any, res: any) => {
 export const getPublicArticle = async (req: any, res: any) => {
     try {
         const { id } = req.params;
-        const params = { TableName: "mediconnect-knowledge-base", Key: { topic: { S: id } } };
+        const userRegion = req.headers['x-user-region'] || "us-east-1"; // 🟢 Detect Region
+        const dynamicDb = getRegionalClient(userRegion); // 🟢 Use Local DB
+
+        const params = { TableName: "mediconnect-knowledge-base", Key: { topic: id } }; // 🟢 Simplified Key for DocumentClient
         
-        // 🟢 FIX: Used 'dbClient' instead of 'dynamo'
-        const { Item } = await dbClient.send(new GetItemCommand(params));
+        const { Item: art } = await dynamicDb.send(new GetCommand(params));
         
-        if (!Item) return res.status(404).json({ error: "Article not found" });
-        const art = unmarshall(Item);
+        if (!art) return res.status(404).json({ error: "Article not found" });
 
         const fhirArticle = {
             id: art.topic,
@@ -66,9 +66,9 @@ export const getPublicArticle = async (req: any, res: any) => {
             content: [{ attachment: { url: art.coverImage, title: art.title } }],
             legacyData: { category: art.category, content: art.content, slug: art.slug }
         };
-        // 🟢 FIX: Added logic to handle missing user/id for guest audit logs
+
         const userId = (req as any).user?.id || "GUEST";
-        await writeAuditLog(userId, "PUBLIC", "READ_KB_ITEM", `Read article: ${art.title}`, { articleId: id });
+        await writeAuditLog(userId, "PUBLIC", "READ_KB_ITEM", `Read article: ${art.title}`, { articleId: id, region: userRegion });
         
         res.json(fhirArticle);
     } catch (error) {
@@ -104,7 +104,8 @@ router.use(authMiddleware);
 // ==========================================
 // 3️⃣ PROTECTED SPECIFIC ROUTES
 // ==========================================
-router.get('/register-patient', getPatientById); // GET is protected
+router.get('/search', searchPatients); 
+router.get('/register-patient', getPatientById); 
 router.post('/identity/verify', verifyIdentity);
 router.get('/:userId', getPatientById);
 router.delete('/me', deleteProfile);

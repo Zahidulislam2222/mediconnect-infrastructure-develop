@@ -6,14 +6,15 @@ services:
       context: ./backend_v2
       dockerfile: patient-service/Dockerfile
     ports:
-      - "8081:8081" # 🟢 FIXED: Matches frontend expectation
+      - "8081:8081" 
     environment:
       - NODE_ENV=development
       - PORT=8081
       - AWS_REGION=us-east-1
     volumes:
-      - ./backend_v2/patient-service:/app/patient-service
-      - ./backend_v2/shared:/app/shared
+      # 🟢 FIX: Matched Dockerfile WORKDIR
+      - ./backend_v2/patient-service:/home/node/app/patient-service
+      - ./backend_v2/shared:/home/node/app/shared
 
   doctor-service:
     build:
@@ -26,10 +27,10 @@ services:
       - PORT=8082
       - AWS_REGION=us-east-1
     volumes:
-      - ./backend_v2/doctor-service:/app/doctor-service
-      - ./backend_v2/shared:/app/shared
+      # 🟢 FIX: Matched Dockerfile WORKDIR
+      - ./backend_v2/doctor-service:/home/node/app/doctor-service
+      - ./backend_v2/shared:/home/node/app/shared
 
-  # 🟢 ADDED: Booking Service
   booking-service:
     build:
       context: ./backend_v2
@@ -40,10 +41,10 @@ services:
       - NODE_ENV=development
       - PORT=8083
     volumes:
-      - ./backend_v2/booking-service:/usr/src/app/booking-service
-      - ./backend_v2/shared:/usr/src/app/shared
+      # 🟢 FIX: Matched Dockerfile WORKDIR
+      - ./backend_v2/booking-service:/home/node/app/booking-service
+      - ./backend_v2/shared:/home/node/app/shared
 
-  # 🟢 ADDED: Communication Service
   communication-service:
     build:
       context: ./backend_v2
@@ -54,13 +55,14 @@ services:
       - NODE_ENV=development
       - PORT=8084
     volumes:
-      - ./backend_v2/communication-service:/app/communication-service
-      - ./backend_v2/shared:/app/shared
+      # 🟢 FIX: Matched Dockerfile WORKDIR
+      - ./backend_v2/communication-service:/home/node/app/communication-service
+      - ./backend_v2/shared:/home/node/app/shared
 
   frontend:
     build: ../mediconnect-hub
     ports:
-      - "5173:5173"
+      - "8080:8080"
     environment:
       - VITE_PATIENT_SERVICE_URL=http://localhost:8081
       - VITE_DOCTOR_SERVICE_URL=http://localhost:8082
