@@ -12,101 +12,90 @@ env:
   AZURE_RESOURCE_GROUP: "mediconnect-rg"
   GCP_PROJECT_ID: "mediconnect-analytics"
   GCP_REPO: "us-central1-docker.pkg.dev/mediconnect-analytics/mediconnect-repo"
+  GCP_SERVICE_ACCOUNT: "data-logger@mediconnect-analytics.iam.gserviceaccount.com"
 
 jobs:
-  # =========================================================
-  # JOB 1: DEPLOY TO AZURE (US Region - HIPAA)
-  # =========================================================
   deploy-azure-us:
     runs-on: "ubuntu-latest"
     steps:
       - name: "📥 Checkout Code"
         uses: actions/checkout@v4
-
+        
       - name: "🔐 Azure Login"
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: "🔑 Login to Azure Container Registry (ACR)"
-        run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
-
-      - name: "🧹 ZERO-ASSUMPTION FIX: Sanitize Build Context"
-        run: |
-          echo "Destroying restrictive .dockerignore files that block the Linux runner..."
-          find . -name ".dockerignore" -delete
           
-          echo "Creating one perfect Master .dockerignore..."
-          echo "node_modules" > .dockerignore
-          echo ".git" >> .dockerignore
-          echo "backend_v2/node_modules" >> .dockerignore
-          echo "backend_v2/doctor-service/node_modules" >> .dockerignore
-          echo "backend_v2/patient-service/node_modules" >> .dockerignore
-
-      - name: "🐳 Build and Push Docker Image"
+      - name: "🔑 Login to ACR"
+        run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
+        
+      - name: "🧹 Sanitize Build Context"
+        run: find . -name ".dockerignore" -delete
+        
+      - name: "🐳 Build and Push to Azure"
         run: |
           IMAGE_TAG=${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}
           docker build -t $IMAGE_TAG -f backend_v2/doctor-service/Dockerfile .
           docker push $IMAGE_TAG
-
-      - name: "🚀 Deploy to Azure Container Apps"
+          
+      - name: "🚀 Deploy Azure Container App"
         uses: azure/container-apps-deploy-action@v1
         with:
-          appSourcePath: "${{ github.workspace }}/backend_v2"
           acrName: ${{ env.AZURE_CONTAINER_REGISTRY }}
           containerAppName: "doctor-service"
           resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
           imageToDeploy: "${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/doctor-service:${{ github.sha }}"
-          environmentVariables: |
-            NODE_ENV=production
-            AWS_REGION=us-east-1
+          # 🟢 HIPAA 100% FIX: Keys are stored as hidden secrets, not plain text env vars
+          secrets: "aws-access-key-id=${{ secrets.AWS_ACCESS_KEY_ID }} aws-secret-access-key=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          environmentVariables: "NODE_ENV=production AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=secretref:aws-access-key-id AWS_SECRET_ACCESS_KEY=secretref:aws-secret-access-key"
 
-  # =========================================================
-  # JOB 2: DEPLOY TO GCP (EU Region - GDPR)
-  # =========================================================
   deploy-gcp-eu:
     runs-on: "ubuntu-latest"
     steps:
       - name: "📥 Checkout Code"
         uses: actions/checkout@v4
-
-      - name: "🔐 Authenticate to Google Cloud"
+        
+      - name: "🔐 GCP Login"
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_CREDENTIALS }}
-
-      - name: "🛠️ Set up Google Cloud SDK"
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: "🔑 Configure Docker for GCP Artifact Registry"
-        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
-
-      - name: "🧹 ZERO-ASSUMPTION FIX: Sanitize Build Context"
-        run: |
-          echo "Destroying restrictive .dockerignore files that block the Linux runner..."
-          find . -name ".dockerignore" -delete
           
-          echo "Creating one perfect Master .dockerignore..."
-          echo "node_modules" > .dockerignore
-          echo ".git" >> .dockerignore
-          echo "backend_v2/node_modules" >> .dockerignore
-          echo "backend_v2/doctor-service/node_modules" >> .dockerignore
-          echo "backend_v2/patient-service/node_modules" >> .dockerignore
-
-      - name: "🐳 Build and Push Docker Image to GCP"
+      - name: "🛠️ Setup Cloud SDK"
+        uses: google-github-actions/setup-gcloud@v2
+        
+      - name: "🔑 Auth Docker"
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+        
+      - name: "🧹 Sanitize Build Context"
+        run: find . -name ".dockerignore" -delete
+        
+      - name: "🐳 Build and Push to GCP"
         run: |
           IMAGE_TAG=${{ env.GCP_REPO }}/doctor-service-eu:${{ github.sha }}
           docker build -t $IMAGE_TAG -f backend_v2/doctor-service/Dockerfile .
           docker push $IMAGE_TAG
 
-      - name: "🚀 Deploy to Cloud Run (Europe-West3 / Frankfurt)"
+      - name: "🛠️ Enable Secret Manager API"
+        run: gcloud services enable secretmanager.googleapis.com
+          
+      - name: "🔒 Inject GCP Secrets (HIPAA Compliance)"
+        # 🟢 HIPAA 100% FIX: Pushes keys into GCP Secret Manager securely, then grants the container access.
+        run: |
+          echo -n "${{ secrets.AWS_ACCESS_KEY_ID }}" | gcloud secrets create aws_access_key_id --data-file=- || echo -n "${{ secrets.AWS_ACCESS_KEY_ID }}" | gcloud secrets versions add aws_access_key_id --data-file=-
+          echo -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" | gcloud secrets create aws_secret_access_key --data-file=- || echo -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" | gcloud secrets versions add aws_secret_access_key --data-file=-
+          gcloud secrets add-iam-policy-binding aws_access_key_id --member="serviceAccount:${{ env.GCP_SERVICE_ACCOUNT }}" --role="roles/secretmanager.secretAccessor"
+          gcloud secrets add-iam-policy-binding aws_secret_access_key --member="serviceAccount:${{ env.GCP_SERVICE_ACCOUNT }}" --role="roles/secretmanager.secretAccessor"
+
+      - name: "🚀 Deploy GCP Cloud Run"
         run: |
           IMAGE_TAG=${{ env.GCP_REPO }}/doctor-service-eu:${{ github.sha }}
+          # 🟢 Uses --update-secrets to mount them securely from the Vault instead of plaintext!
           gcloud run deploy doctor-service-eu \
-            --image $IMAGE_TAG \
+            --image "$IMAGE_TAG" \
             --project ${{ env.GCP_PROJECT_ID }} \
             --region europe-west3 \
             --port 8082 \
             --platform managed \
-            --allow-unauthenticated \
-            --set-env-vars NODE_ENV=production
+            --service-account ${{ env.GCP_SERVICE_ACCOUNT }} \
+            --set-env-vars "NODE_ENV=production,AWS_REGION=eu-central-1" \
+            --update-secrets "AWS_ACCESS_KEY_ID=aws_access_key_id:latest,AWS_SECRET_ACCESS_KEY=aws_secret_access_key:latest"
