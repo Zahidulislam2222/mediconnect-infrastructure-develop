@@ -9,11 +9,11 @@
         "build": "tsc"
     },
     "dependencies": {
-        "@aws-sdk/client-apigatewaymanagementapi": "^3.985.0",
+        "@aws-sdk/client-apigatewaymanagementapi": "^3.995.0",
         "@aws-sdk/client-bedrock-runtime": "^3.983.0",
         "@aws-sdk/client-chime-sdk-media-pipelines": "^3.987.0",
         "@aws-sdk/client-chime-sdk-meetings": "^3.500.0",
-        "@aws-sdk/client-comprehendmedical": "^3.985.0",
+        "@aws-sdk/client-comprehendmedical": "^3.995.0",
         "@aws-sdk/client-dynamodb": "^3.500.0",
         "@aws-sdk/client-sns": "^3.985.0",
         "@aws-sdk/client-ssm": "^3.983.0",
