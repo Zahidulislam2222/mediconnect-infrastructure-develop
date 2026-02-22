@@ -4,10 +4,9 @@ import { SignCommand } from "@aws-sdk/client-kms";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
 
-// 🟢 ARCHITECTURE FIX: Use Shared Factories to prevent Socket Exhaustion and Data Leaks
 import { 
     getRegionalS3Client, 
-    getRegionalKMSClient, // 🔍 Ensure this is exported in your shared/aws-config.ts
+    getRegionalKMSClient, 
     getSSMParameter 
 } from "../config/aws"; 
 
@@ -22,50 +21,32 @@ interface PrescriptionData {
 }
 
 export class PDFGenerator {
-    private kmsKeyId: string;
-
-    constructor() {
-        this.kmsKeyId = process.env.KMS_KEY_ID || "";
-    }
-
-    /**
-     * Generates a signed PDF and returns the S3 Presigned URL + FHIR Metadata
-     * 🟢 GDPR FIX: Now accepts 'region' to ensure data residency compliance.
-     */
+    // 🟢 GDPR FIX: Now accepts 'region' to ensure data residency compliance.
     public async generatePrescriptionPDF(data: PrescriptionData, region: string = "us-east-1"): 
         Promise<{ pdfUrl: string, signature: string, fhirMetadata: any }> {
         
-        // 1. Digital Signature Generation (Regional KMS)
         const signature = await this.signData(data, region);
-
-        // 2. Generate PDF Buffer
         const pdfBuffer = await this.createPDFBuffer(data, signature);
 
-        // 3. Resolve Regional Infrastructure
         const s3Client = getRegionalS3Client(region);
-        const isEU = region.toUpperCase().includes('EU');
+        const isEU = region.toUpperCase() === 'EU' || region === 'eu-central-1';
         const bucketName = isEU 
             ? (process.env.S3_BUCKET_PRESCRIPTIONS_EU || "mediconnect-prescriptions-eu")
             : (process.env.S3_BUCKET_PRESCRIPTIONS_US || "mediconnect-prescriptions");
 
-        // 4. Upload to Regional S3 (GDPR Sovereignty)
         const s3Key = `prescriptions/${data.prescriptionId}.pdf`;
         await s3Client.send(new PutObjectCommand({
             Bucket: bucketName,
             Key: s3Key,
             Body: pdfBuffer,
             ContentType: "application/pdf",
-            // 🟢 HIPAA: Ensure encryption at rest
             ServerSideEncryption: "aws:kms" 
         }));
 
-        // 5. Generate Presigned View URL (Valid for 15 mins)
         const signedUrl = await getSignedUrl(s3Client, new GetObjectCommand({
-            Bucket: bucketName,
-            Key: s3Key
+            Bucket: bucketName, Key: s3Key
         }), { expiresIn: 900 });
 
-        // 6. 🟢 FHIR R4 COMPLIANCE: Wrap file in a DocumentReference
         const fhirMetadata = {
             resourceType: "DocumentReference",
             id: uuidv4(),
@@ -75,11 +56,7 @@ export class PDFGenerator {
             author: [{ display: data.doctorName }],
             date: data.timestamp,
             content: [{
-                attachment: {
-                    contentType: "application/pdf",
-                    url: s3Key,
-                    hash: signature // Signature used as integrity hash
-                }
+                attachment: { contentType: "application/pdf", url: s3Key, hash: signature }
             }]
         };
 
@@ -87,14 +64,9 @@ export class PDFGenerator {
     }
 
     private async signData(data: PrescriptionData, region: string): Promise<string> {
-        // 🟢 PROOF AI FIX: We must fetch the key for the TARGET region every time
-        // to prevent "Key Region Mismatch" errors.
-        
         const parameterPath = "/mediconnect/prod/kms/signing_key_id";
-        
-        // 1. Get the Key ID for the specific region (SSM is regional)
-        // Note: Ensure your getSSMParameter helper accepts a region argument
-        const kmsKeyId = await getSSMParameter(parameterPath, region); 
+        // 🟢 FIX: Ensure we explicitly pass `true` for decryption of the secure KMS key ID
+        const kmsKeyId = await getSSMParameter(parameterPath, region, true); 
         
         if (!kmsKeyId) {
             throw new Error(`CRITICAL: KMS Key ID not found in Parameter Store for region: ${region}`);
@@ -104,7 +76,7 @@ export class PDFGenerator {
         const payload = JSON.stringify(data);
         
         const command = new SignCommand({
-            KeyId: kmsKeyId, // 🔒 This is now the verified regional key
+            KeyId: kmsKeyId, 
             Message: Buffer.from(payload),
             MessageType: "RAW",
             SigningAlgorithm: "RSASSA_PKCS1_V1_5_SHA_256"
@@ -123,7 +95,6 @@ export class PDFGenerator {
             doc.on("end", () => resolve(Buffer.concat(buffers)));
             doc.on("error", reject);
 
-            // --- PDF CONTENT ---
             doc.fontSize(20).text("MediConnect Digital Prescription", { align: "center" });
             doc.moveDown();
             doc.fontSize(12).text(`Prescription ID: ${data.prescriptionId}`);

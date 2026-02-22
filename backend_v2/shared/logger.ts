@@ -7,10 +7,10 @@ import winston from 'winston';
 const maskPII = winston.format((info: any) => {
     // Regex Patterns
     const patterns = {
-        email: /([a-zA-Z0-9_\-\.]+)@([a-zA-Z0-9_\-\.]+)\.([a-zA-Z]{2,5})/g,
-        ssn: /\b\d{3}-\d{2}-\d{4}\b/g,
-        phone: /\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g
-    };
+    email: /([a-zA-Z0-9_\-\.]+)@([a-zA-Z0-9_\-\.]+)\.([a-zA-Z]{2,5})/g,
+    ssn: /\b\d{3}-\d{2}-\d{4}\b/g,
+    phone: /(?:(?:\+|00)[1-9]\d{0,3}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}\b/g
+};
 
     const scrub = (str: string): string => {
         return str

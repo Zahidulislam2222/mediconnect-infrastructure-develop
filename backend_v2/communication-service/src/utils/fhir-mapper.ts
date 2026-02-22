@@ -7,11 +7,13 @@
 const PII_REGEX = {
     SSN: /\b\d{3}-\d{2}-\d{4}\b/g,
     CREDIT_CARD: /\b(?:\d[ -]*?){13,16}\b/g,
-    PHONE: /\b(?:\+?1[-. ]?)?\(?([2-9][0-8][0-5])\)?[-. ]?([2-9][0-8][0-5])[-. ]?([0-9]{4})\b/g,
+    // 🟢 GDPR FIX: Expanded Regex to catch International (EU/Global) numbers, not just US (+1)
+    // Matches: +49..., 0044..., (030)...
+    PHONE: /(?:(?:\+|00)[1-9]\d{0,3}[\s.-]?)?(?:\(?\d{2,5}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}\b/g,
     EMAIL: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g,
     URL: /\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|]/ig,
     IP_ADDR: /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g,
-    DOB: /\b(?:\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})\b/g // 🟢 ADDED: Basic Date of Birth masking
+    DOB: /\b(?:\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})\b/g 
 };
 
 /**

@@ -3,34 +3,42 @@ import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
 import dotenv from "dotenv";
+import rateLimit from "express-rate-limit";
+import { GetParametersCommand } from "@aws-sdk/client-ssm";
+
 import { chatController } from "./controllers/chat.controller";
 import { videoController } from "./controllers/video.controller";
-import { getSSMParameter } from "./config/aws";
+import { aiRoutes } from "./routes/ai.routes"; // 🟢 From previous step
 import { authMiddleware } from './middleware/auth.middleware';
-import { checkSymptoms } from "./controllers/symptom.controller";
-import { predictRisk, summarizeConsultation } from "./controllers/predictive.controller";
-import { analyzeClinicalImage } from "./controllers/imaging.controller";
+import { getRegionalSSMClient } from "./config/aws"; // 🟢 REGIONAL FACTORY
 
 dotenv.config();
 
 const app = express();
+app.set('trust proxy', 1);
+
 const PORT = process.env.PORT || 8084;
 
-// --- 1. COMPLIANT CORS (FHIR/HIPAA) ---
+const globalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, 
+    max: 100, 
+    message: { error: "Too many requests. Please try again later." }
+});
+app.use(globalLimiter);
+
+// --- 1. COMPLIANT CORS ---
 const allowedOrigins = [
     'http://localhost:8080',
     'http://localhost:5173',
     /\.web\.app$/,
-    /\.azurecontainerapps\.io$/
+    /\.azurecontainerapps\.io$/,
+    /\.run\.app$/
 ];
-
-if (process.env.FRONTEND_URL) {
-    allowedOrigins.push(process.env.FRONTEND_URL);
-}
+if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
 // --- 2. SECURITY MIDDLEWARE ---
 app.use(helmet({
-    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }, // Strict Transport Security
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
@@ -45,87 +53,81 @@ app.use(cors({
     origin: allowedOrigins,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    // FHIR Headers (Prefer, If-Match) + Internal Security Headers
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Internal-Secret', 'X-User-ID', 'Prefer', 'If-Match']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Internal-Secret', 'X-User-ID', 'Prefer', 'If-Match', 'x-user-region']
 }));
 app.options('*', cors());
 
-app.use(express.json({ limit: '50mb' })); // High limit for Clinical Images
+// 🟢 High limit required for Base64 Clinical Images
+app.use(express.json({ limit: '50mb' })); 
 
-// GDPR/HIPAA Audit Logging
-app.use(morgan((tokens, req, res) => {
-    return [
-        `[AUDIT]`,
-        tokens.method(req, res),
-        tokens.url(req, res)?.split('?')[0], // Don't log query params (might contain PII)
-        tokens.status(req, res),
-        tokens['response-time'](req, res), 'ms',
-        `User: ${(req as any).user?.sub || 'Guest'}`,
-        `IP: ${req.ip}`
-    ].join(' ');
-}, {
-    skip: (req) => req.method === 'OPTIONS' || req.url === '/health'
-}));
-
-// --- 3. PUBLIC HEALTH CHECK (Azure Liveness Probe) ---
-app.get('/health', (req, res) => {
-    res.status(200).json({
-        status: "UP",
-        service: "communication-service",
-        timestamp: new Date().toISOString()
-    });
+// 🟢 HIPAA AUDIT FIX: Secure Identity Logging
+morgan.token('verified-user', (req: any) => {
+    return req.user?.sub || req.user?.id ? `User:${req.user.sub || req.user.id}` : 'Unauthenticated';
 });
 
-// --- 4. SECURE STARTUP & ROUTES ---
-const startServer = async () => {
-    // DIAGNOSTIC: Check if AWS Keys exist (Masked)
-    const keyCheck = process.env.AWS_ACCESS_KEY_ID ? "PRESENT" : "MISSING";
-    console.log(`🔎 Boot Check: AWS Creds [${keyCheck}] | Region [${process.env.AWS_REGION || 'us-east-1'}]`);
+app.use(morgan((tokens, req, res) => {
+    return [
+        `[AUDIT]`, tokens.method(req, res), tokens.url(req, res)?.split('?')[0],
+        tokens.status(req, res), tokens['response-time'](req, res), 'ms',
+        tokens['verified-user'](req, res), `IP:${req.ip}`
+    ].join(' ');
+}, { skip: (req) => req.url === '/health' || req.method === 'OPTIONS' }));
+
+// --- 3. ROUTES ---
+app.get('/health', (req, res) => res.status(200).json({ status: 'UP', service: 'communication-service' }));
+
+// Apply auth middleware to all clinical routes
+app.use("/chat", authMiddleware, chatController);
+app.use("/video", authMiddleware, videoController);
+app.use("/ai", aiRoutes); // 🟢 Clean mounting
+
+// --- 4. 100% COMPLIANT VAULT SYNC ---
+async function loadSecrets() {
+    const region = process.env.AWS_REGION || 'us-east-1';
+    const ssm = getRegionalSSMClient(region);
 
     try {
-        console.log("🔐 Initializing Communication Service Configuration...");
+        console.log(`🔐 Synchronizing Communication secrets with AWS Vault [${region}]...`);
+        const command = new GetParametersCommand({
+            Names: [
+                '/mediconnect/prod/cognito/user_pool_id',
+                '/mediconnect/prod/cognito/client_id',
+                '/mediconnect/prod/cognito/user_pool_id_eu',
+                '/mediconnect/prod/cognito/client_id_doctor',
+                '/mediconnect/prod/cognito/client_id_eu_doctor'
+            ],
+            WithDecryption: true
+        });
 
-        // Fail-Safe Secret Loading
-        // Only fetch if NOT already in env (Prevents overwriting Azure Manual Vars)
-        if (!process.env.COGNITO_USER_POOL_ID) {
-            const poolId = await getSSMParameter("/mediconnect/prod/cognito/user_pool_id");
-            if (poolId) process.env.COGNITO_USER_POOL_ID = poolId;
-        }
-        if (!process.env.COGNITO_CLIENT_ID) {
-            const clientId = await getSSMParameter("/mediconnect/prod/cognito/client_id");
-            if (clientId) process.env.COGNITO_CLIENT_ID = clientId;
-        }
-        if (!process.env.COGNITO_USER_POOL_ID || !process.env.COGNITO_CLIENT_ID) {
-    throw new Error("CRITICAL_SECURITY_CONFIG_MISSING: Authentication will fail. Check AWS Credentials/SSM.");
+        const { Parameters } = await ssm.send(command);
+
+        if (!Parameters || Parameters.length === 0) throw new Error("No secrets found in Parameter Store.");
+
+        Parameters.forEach(p => {
+            if (p.Name?.endsWith('/user_pool_id')) process.env.COGNITO_USER_POOL_ID = p.Value;
+            if (p.Name?.endsWith('/client_id')) process.env.COGNITO_CLIENT_ID = p.Value;
+            if (p.Name?.endsWith('/user_pool_id_eu')) process.env.COGNITO_USER_POOL_ID_EU = p.Value;
+            if (p.Name?.endsWith('/client_id_doctor')) process.env.COGNITO_CLIENT_ID_DOCTOR = p.Value;
+            if (p.Name?.endsWith('/client_id_eu_doctor')) process.env.COGNITO_CLIENT_ID_EU_DOCTOR = p.Value;
+        });
+
+        console.log("✅ AWS Vault Sync Complete.");
+    } catch (e: any) {
+        console.error(`❌ FATAL: Vault Sync Failed. System cannot start securely.`, e.message);
+        process.exit(1);
+    }
 }
 
-        // 🛡️ Apply Identity Protection to ALL routes below
-        app.use(authMiddleware);
-
-        // Core Communication Routes
-        app.use("/chat", chatController);
-        app.use("/video", videoController);
-
-        // AI Clinical Suite (HIPAA: Ensure inputs are de-identified in controller)
-        app.post("/chat/symptom-check", checkSymptoms);
-        app.post("/chat/predict-health", predictRisk);
-        app.post("/chat/analyze-image", analyzeClinicalImage);
-        app.post("/predict/summarize", summarizeConsultation);
-
+const startServer = async () => {
+    try {
+        await loadSecrets();
         app.listen(Number(PORT), '0.0.0.0', () => {
             console.log(`🚀 Communication Service Production Ready on port ${PORT}`);
         });
-
     } catch (error: any) {
         console.error("❌ CRITICAL: Failed to start Communication Service:", error.message);
-        // Fail-Safe: Don't exit. The container stays alive so you can debug via Azure Console.
-        // It serves the health check but logs the error.
-        app.listen(Number(PORT), '0.0.0.0', () => {
-            console.warn(`⚠️ Service started in DEGRADED mode due to startup error.`);
-        });
+        process.exit(1);
     }
 };
 
 startServer();
-
-export default app;

@@ -1,31 +1,41 @@
 import { Router, Request, Response } from "express";
 import { ChimeSDKMeetingsClient, CreateMeetingCommand, CreateAttendeeCommand, DeleteMeetingCommand } from "@aws-sdk/client-chime-sdk-meetings";
 import { ChimeSDKMediaPipelinesClient, CreateMediaCapturePipelineCommand, DeleteMediaCapturePipelineCommand } from "@aws-sdk/client-chime-sdk-media-pipelines";
-import { docClient } from "../config/aws";
+import { getRegionalClient } from "../config/aws";
 import { PutCommand, GetCommand, DeleteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { v4 as uuidv4 } from "uuid";
 import { writeAuditLog } from "../../../shared/audit";
 
 const router = Router();
-const chimeClient = new ChimeSDKMeetingsClient({ region: "us-east-1" });
-const pipelineClient = new ChimeSDKMediaPipelinesClient({ region: "us-east-1" });
 
-const TABLE_SESSIONS = "mediconnect-video-sessions";
-const RECORDING_BUCKET = "mediconnect-consultation-recordings";
+const TABLE_SESSIONS = process.env.TABLE_SESSIONS || "mediconnect-video-sessions";
+const BASE_RECORDING_BUCKET = process.env.RECORDING_BUCKET || "mediconnect-consultation-recordings";
+
+// 🟢 GDPR FIX: Extract region
+export const extractRegion = (req: Request): string => {
+    const rawRegion = req.headers['x-user-region'];
+    return Array.isArray(rawRegion) ? rawRegion[0] : (rawRegion || "us-east-1");
+};
 
 // POST /video/session - Create or Join a meeting
 router.post("/session", async (req: Request, res: Response) => {
+    const region = extractRegion(req);
+    const regionalDb = getRegionalClient(region);
+    
+    // 🟢 GDPR/Schrems II FIX: Force Chime and Recordings into the correct legal zone
+    const targetAwsRegion = region.toUpperCase() === 'EU' ? 'eu-central-1' : 'us-east-1';
+    const targetBucket = region.toUpperCase() === 'EU' ? `${BASE_RECORDING_BUCKET}-eu` : BASE_RECORDING_BUCKET;
+
+    const chimeClient = new ChimeSDKMeetingsClient({ region: targetAwsRegion });
+    const pipelineClient = new ChimeSDKMediaPipelinesClient({ region: targetAwsRegion });
+
     const { appointmentId } = req.body;
-    // 🟢 AUTH CHECK: Ensure middleware populated this
     const userId = (req as any).user?.sub; 
 
-    if (!appointmentId || !userId) {
-        return res.status(400).json({ error: "Missing appointmentId or User ID" });
-    }
+    if (!appointmentId || !userId) return res.status(400).json({ error: "Missing appointmentId or User ID" });
 
     try {
-        // 🟢 HIPAA CHECK: Verify user belongs to this appointment
-        const aptRes = await docClient.send(new GetCommand({
+        const aptRes = await regionalDb.send(new GetCommand({
             TableName: "mediconnect-appointments",
             Key: { appointmentId }
         }));
@@ -35,24 +45,22 @@ router.post("/session", async (req: Request, res: Response) => {
             return res.status(403).json({ error: "Unauthorized: You are not a participant" });
         }
 
-        const dbRes = await docClient.send(new GetCommand({
-            TableName: TABLE_SESSIONS,
-            Key: { appointmentId }
+        const dbRes = await regionalDb.send(new GetCommand({
+            TableName: TABLE_SESSIONS, Key: { appointmentId }
         }));
 
         let meeting = dbRes.Item?.meeting;
 
         if (!meeting) {
-            // 1. Create Meeting
+            // 1. Create Meeting in correct Region
             const chimeRes = await chimeClient.send(new CreateMeetingCommand({
                 ClientRequestToken: uuidv4(),
-                MediaRegion: "us-east-1",
+                MediaRegion: targetAwsRegion, // 🟢 Forces data to stay local
                 ExternalMeetingId: appointmentId,
                 MeetingFeatures: { Audio: { EchoReduction: "AVAILABLE" } }
             } as any));
             meeting = chimeRes.Meeting;
 
-            // 🟢 2. START RECORDING PIPELINE (FIXED CONFIGURATION)
             let pipelineId = null;
             if (meeting?.MeetingArn) {
                 try {
@@ -60,47 +68,37 @@ router.post("/session", async (req: Request, res: Response) => {
                         SourceType: "ChimeSdkMeeting",
                         SourceArn: meeting.MeetingArn,
                         SinkType: "S3Bucket",
-                        SinkArn: `arn:aws:s3:::${RECORDING_BUCKET}/recordings/${appointmentId}`,
+                        SinkArn: `arn:aws:s3:::${targetBucket}/recordings/${appointmentId}`, // 🟢 Save to local EU/US bucket
                         ChimeSdkMeetingConfiguration: {
                             ArtifactsConfiguration: {
-                                // 🟢 FIX: Audio MUST be AudioOnly. 
                                 Audio: { MuxType: "AudioOnly" }, 
-                                // VideoOnly captures all individual streams (including active speaker)
                                 Video: { State: "Enabled", MuxType: "VideoOnly" },
                                 Content: { State: "Enabled", MuxType: "ContentOnly" }
                             }
                         }
                     }));
                     pipelineId = pipelineRes.MediaCapturePipeline?.MediaPipelineId;
-                    console.log(`🎥 Recording started: ${pipelineId}`);
                 } catch (recErr: any) {
                     console.error("Failed to start recording:", recErr.message);
-                    // Don't block the meeting if recording fails, but log it
                 }
             }
 
-            // 3. SAVE MEETING + PIPELINE ID TO DB
-            await docClient.send(new PutCommand({
+            await regionalDb.send(new PutCommand({
                 TableName: TABLE_SESSIONS,
                 Item: {
-                    appointmentId,
-                    meeting,
-                    pipelineId, 
+                    appointmentId, meeting, pipelineId, 
                     createdAt: new Date().toISOString(),
-                    ttl: Math.floor(Date.now() / 1000) + 86400 // 24 Hours TTL
+                    ttl: Math.floor(Date.now() / 1000) + 86400
                 }
             }));
         }
 
-        // 4. Create Attendee
         const attendeeRes = await chimeClient.send(new CreateAttendeeCommand({
-            MeetingId: meeting.MeetingId,
-            ExternalUserId: userId
+            MeetingId: meeting.MeetingId, ExternalUserId: userId
         }));
 
-        // 5. Update Appointment Status (Arrived)
         try {
-            await docClient.send(new UpdateCommand({
+            await regionalDb.send(new UpdateCommand({
                 TableName: "mediconnect-appointments",
                 Key: { appointmentId },
                 UpdateExpression: "SET #res.#stat = :s, patientArrived = :arrived",
@@ -109,7 +107,7 @@ router.post("/session", async (req: Request, res: Response) => {
             }));
         } catch (e) { console.warn("Could not update FHIR status", e); }
 
-        await writeAuditLog(userId, userId, "VIDEO_SESSION_JOINED", `User joined appointment ${appointmentId}`);
+        await writeAuditLog(userId, userId, "VIDEO_SESSION_JOINED", `Joined appointment ${appointmentId}`, { region, ipAddress: req.ip });
 
         res.json({ Meeting: meeting, Attendee: attendeeRes.Attendee });
     } catch (error: any) {
@@ -118,65 +116,48 @@ router.post("/session", async (req: Request, res: Response) => {
     }
 });
 
-// DELETE /video/session - End meeting and stop per-minute billing
 router.delete("/session", async (req: Request, res: Response) => {
+    const region = extractRegion(req);
+    const regionalDb = getRegionalClient(region);
+    const targetAwsRegion = region.toUpperCase() === 'EU' ? 'eu-central-1' : 'us-east-1';
+
+    const chimeClient = new ChimeSDKMeetingsClient({ region: targetAwsRegion });
+    const pipelineClient = new ChimeSDKMediaPipelinesClient({ region: targetAwsRegion });
+
     const appointmentId = req.query.appointmentId as string;
     const userId = (req as any).user?.sub;
-    // 🟢 AUTH CHECK: Make sure 'role' exists. If not, default to patient.
-    // Ensure your auth.middleware.ts attaches user groups/role
     const groups = (req as any).user?.['cognito:groups'] || [];
     const userRole = groups.includes('doctor') ? 'doctor' : 'patient';
 
     try {
-        const dbRes = await docClient.send(new GetCommand({
-            TableName: TABLE_SESSIONS,
-            Key: { appointmentId }
+        const dbRes = await regionalDb.send(new GetCommand({
+            TableName: TABLE_SESSIONS, Key: { appointmentId }
         }));
-
         const session = dbRes.Item;
 
-        // 1. Stop Recording Pipeline (if exists)
         if (session?.pipelineId) {
             try {
-                await pipelineClient.send(new DeleteMediaCapturePipelineCommand({
-                    MediaPipelineId: session.pipelineId
-                }));
-                console.log(`🛑 Recording stopped: ${session.pipelineId}`);
-            } catch (e) {
-                console.warn("Failed to stop recording pipeline", e);
-            }
+                await pipelineClient.send(new DeleteMediaCapturePipelineCommand({ MediaPipelineId: session.pipelineId }));
+            } catch (e) { console.warn("Failed to stop recording pipeline", e); }
         }
 
         if (session?.meeting?.MeetingId) {
-            // 2. Stop Chime billing (Delete Meeting)
             try {
-                await chimeClient.send(new DeleteMeetingCommand({
-                    MeetingId: session.meeting.MeetingId
-                }));
+                await chimeClient.send(new DeleteMeetingCommand({ MeetingId: session.meeting.MeetingId }));
             } catch (e) { console.warn("Meeting already deleted"); }
 
-            // 3. Delete session record
-            await docClient.send(new DeleteCommand({
-                TableName: TABLE_SESSIONS,
-                Key: { appointmentId }
-            }));
+            await regionalDb.send(new DeleteCommand({ TableName: TABLE_SESSIONS, Key: { appointmentId } }));
 
-            // 4. Update Appointment Status
-            // Doctors complete the appt, Patients just leave.
             const clinicalStatus = userRole === 'doctor' ? 'fulfilled' : 'arrived';
             
-            await docClient.send(new UpdateCommand({
-                TableName: "mediconnect-appointments",
-                Key: { appointmentId },
+            await regionalDb.send(new UpdateCommand({
+                TableName: "mediconnect-appointments", Key: { appointmentId },
                 UpdateExpression: "SET #res.#stat = :s, #s = :legacyStatus",
                 ExpressionAttributeNames: { "#res": "resource", "#stat": "status", "#s": "status" },
-                ExpressionAttributeValues: { 
-                    ":s": clinicalStatus,
-                    ":legacyStatus": userRole === 'doctor' ? "COMPLETED" : "CONFIRMED"
-                }
+                ExpressionAttributeValues: { ":s": clinicalStatus, ":legacyStatus": userRole === 'doctor' ? "COMPLETED" : "CONFIRMED" }
             }));
 
-            await writeAuditLog(userId, userId, "VIDEO_SESSION_ENDED", `Meeting ${appointmentId} ended`);
+            await writeAuditLog(userId, userId, "VIDEO_SESSION_ENDED", `Meeting ${appointmentId} ended`, { region, ipAddress: req.ip });
         }
 
         res.json({ success: true, message: "Meeting ended and billing stopped" });

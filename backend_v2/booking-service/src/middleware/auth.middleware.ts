@@ -1,42 +1,39 @@
 import { Request, Response, NextFunction } from 'express';
-import { JwtRsaVerifier } from "aws-jwt-verify";
-import axios from "axios";
-import dotenv from 'dotenv';
-dotenv.config(); // 🟢 THIS MUST BE HERE
+import { CognitoJwtVerifier } from "aws-jwt-verify";
+import { COGNITO_CONFIG } from '../config/aws';
+import { writeAuditLog } from "../../../shared/audit";
 
-let verifier: any;
+// 🟢 REGIONAL CACHE: We keep two verifiers alive in memory
+const verifiers: Record<string, any> = {
+    'us-east-1': null,
+    'eu-central-1': null
+};
 
-export const getVerifier = async () => {
-    if (!verifier) {
-        const poolId = process.env.COGNITO_USER_POOL_ID;
-        const clientId = process.env.COGNITO_CLIENT_ID;
-        const region = process.env.AWS_REGION || "us-east-1";
+// 🟢 GDPR HELPER: Determine which pool to check
+const extractRegion = (req: Request): string => {
+    const rawRegion = req.headers['x-user-region'];
+    const r = Array.isArray(rawRegion) ? rawRegion[0] : (rawRegion || "us-east-1");
+    return r.toUpperCase() === 'EU' ? 'eu-central-1' : 'us-east-1';
+};
 
-        if (!poolId || !clientId || poolId.includes('PLACEHOLDER')) {
-            throw new Error("AUTH_NOT_READY: Real Cognito secrets not loaded");
-        }
+const getVerifier = async (region: string) => {
+    if (verifiers[region]) return verifiers[region];
 
-        const issuerUrl = `https://cognito-idp.${region}.amazonaws.com/${poolId}`;
-        const jwksUrl = `${issuerUrl}/.well-known/jwks.json`;
+    const config = region === 'eu-central-1' ? COGNITO_CONFIG.EU : COGNITO_CONFIG.US;
 
-        try {
-            console.log(`Fetching Auth Keys (30s timeout)...`);
-            const response = await axios.get(jwksUrl, { timeout: 30000 });
-            const jwks = response.data;
-
-            verifier = JwtRsaVerifier.create({
-                issuer: issuerUrl,
-                audience: clientId,
-                //tokenUse: "id",
-                jwks: jwks
-            });
-            console.log("✅ Auth Gatekeeper: READY");
-        } catch (error: any) {
-            console.error("❌ Key Fetch Failed:", error.message);
-            throw error;
-        }
+    if (!config.USER_POOL_ID || !config.CLIENT_PATIENT) {
+        throw new Error(`AUTH_CRASH: Missing Cognito Config for ${region}`);
     }
-    return verifier;
+
+    // 🟢 SECURE: Strict verification against specific Regional Pool
+    verifiers[region] = CognitoJwtVerifier.create({
+        userPoolId: config.USER_POOL_ID,
+        tokenUse: "id",
+        clientId: [config.CLIENT_PATIENT, config.CLIENT_DOCTOR], // Allow both apps
+        groups: null, // We check groups manually logic
+    });
+
+    return verifiers[region];
 };
 
 export const authMiddleware = async (req: Request, res: Response, next: NextFunction) => {
@@ -47,14 +44,39 @@ export const authMiddleware = async (req: Request, res: Response, next: NextFunc
         }
 
         const token = authHeader.split(' ')[1];
-        const v = await getVerifier();
+        
+        // 1. Identify Jurisdiction (GDPR)
+        const region = extractRegion(req);
+        
+        // 2. Get the Correct Verifier (US or EU)
+        const v = await getVerifier(region);
+
+        // 3. Verify Token (Crypto Check)
         const payload = await v.verify(token);
 
-        (req as any).user = payload;
+        // 4. Attach Verified User
+        (req as any).user = {
+            sub: payload.sub,
+            email: payload.email,
+            // 🟢 NORMALIZE GROUPS: Handle Cognito array vs Single string
+            role: payload["custom:role"] || (payload["cognito:groups"] ? payload["cognito:groups"][0] : "patient"),
+            region: region // Pass this down so controllers know where to route data
+        };
+
         next();
     } catch (err: any) {
-        console.error("Auth Failure:", err.message);
-        const status = err.message.includes('AUTH_NOT_READY') ? 503 : 401;
+        // 🟢 HIPAA AUDIT: Log the intrusion attempt
+        const ip = req.ip || req.headers['x-forwarded-for'] || 'UNKNOWN';
+        const region = extractRegion(req);
+        
+        console.error(`❌ Auth Failed [${region}]:`, err.message);
+        
+        // Don't log "Token Expired" spam, only actual attacks/failures
+        if (!err.message.includes('expired')) {
+            await writeAuditLog("SYSTEM", "UNKNOWN", "AUTH_FAILURE", `Token rejection: ${err.message}`, { region, ipAddress: String(ip) });
+        }
+
+        const status = err.message.includes('AUTH_CRASH') ? 503 : 401;
         return res.status(status).json({ error: "Unauthorized" });
     }
 };

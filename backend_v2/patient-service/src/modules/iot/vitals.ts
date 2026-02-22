@@ -1,6 +1,8 @@
 import { Request, Response } from "express";
 import { getRegionalClient } from "../../config/aws";
 import { QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { GoogleAuth } from "google-auth-library";
+import { getSSMParameter } from "../../config/aws";
 import { writeAuditLog } from "../../../../shared/audit";
 
 export const getVitals = async (req: Request, res: Response) => {
@@ -82,5 +84,59 @@ export const getVitals = async (req: Request, res: Response) => {
     } catch (err: any) {
         console.error("Vitals Error:", err.message);
         res.status(500).json({ error: "Internal Server Error during vitals retrieval." });
+    }
+};
+
+ /* 🟢 GDPR 2026: Regional IoT BigQuery Sync
+ * Routes EU wearables to Frankfurt (iot_eu) and US wearables to Virginia (iot).
+ */
+export const pushVitalToBigQuery = async (patientId: string, vitalData: any, region: string) => {
+    try {
+        // 1. Fetch the correct Service Account Key from the Regional Vault
+        const saKey = await getSSMParameter("/mediconnect/prod/gcp/service-account", region, true);
+        if (!saKey) return;
+
+        const credentials = JSON.parse(saKey);
+        const auth = new GoogleAuth({
+            credentials,
+            scopes: ['https://www.googleapis.com/auth/cloud-platform']
+        });
+
+        const client = await auth.getClient();
+        const accessToken = (await client.getAccessToken()).token;
+        const projectId = credentials.project_id;
+
+        // 2. 🟢 DATA SOVEREIGNTY: Select Dataset based on Region
+        const datasetName = region.toUpperCase() === 'EU' ? 'iot_eu' : 'iot';
+        const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${projectId}/datasets/${datasetName}/tables/vitals_raw/insertAll`;
+
+        // 3. Push to BigQuery (Matches your exact "data" JSON column schema)
+        await fetch(url, {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${accessToken}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                kind: "bigquery#tableDataInsertAllRequest",
+                rows: [{
+                    json: {
+                        // Your screenshot shows a single column named "data" of type JSON
+                        data: JSON.stringify({
+                            patientId: patientId,
+                            timestamp: new Date().toISOString(),
+                            region: region,
+                            heartRate: vitalData.heartRate,
+                            systolicBP: vitalData.systolicBP,
+                            diastolicBP: vitalData.diastolicBP,
+                            oxygenLevel: vitalData.oxygenLevel
+                        })
+                    }
+                }]
+            })
+        });
+        
+    } catch (err: any) {
+        console.error(`❌ BigQuery IoT Sync Failed [${region}]:`, err.message);
     }
 };

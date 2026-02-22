@@ -19,6 +19,7 @@
         "@aws-sdk/client-ssm": "^3.983.0",
         "@aws-sdk/lib-dynamodb": "^3.500.0",
         "@azure/cosmos": "^4.9.1",
+        "@google-cloud/firestore": "^8.3.0",
         "aws-jwt-verify": "^4.0.1",
         "axios": "^1.13.4",
         "cors": "^2.8.6",

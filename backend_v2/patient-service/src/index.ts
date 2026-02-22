@@ -18,6 +18,8 @@ import iotRoutes from "./modules/iot/iot.routes";
 import { handleEmergencyDetection } from './modules/iot/emergency';
 import rateLimit from 'express-rate-limit';
 
+import { pushVitalToBigQuery } from './modules/iot/vitals';
+
 dotenv.config();
 
 const app = express();
@@ -212,6 +214,11 @@ const startIoTBridge = () => {
                     });
                 }
                 io.to(`patient_${patientId}`).emit('vital_update', { ...payload, timestamp: new Date().toISOString() });
+
+                // 🟢 NEW: Push this vital reading to the correct BigQuery Region
+                // We don't use 'await' here because we don't want analytics to slow down real-time alerts
+                pushVitalToBigQuery(patientId, payload, region).catch((err: any) => console.error(err));
+
             } catch (e) { console.error("MQTT Message Error"); }
         });
 

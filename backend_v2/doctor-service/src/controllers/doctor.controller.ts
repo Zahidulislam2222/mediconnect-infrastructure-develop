@@ -4,7 +4,7 @@ import { TextractClient, AnalyzeDocumentCommand } from "@aws-sdk/client-textract
 import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
 import { google } from 'googleapis';
 import { PutCommand, GetCommand, UpdateCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
-import { getRegionalClient } from '../config/aws';
+import { getRegionalClient, getSSMParameter } from '../config/aws';
 import { writeAuditLog } from '../../../shared/audit';
 import jwt from 'jsonwebtoken';
 
@@ -85,6 +85,7 @@ export const createDoctor = catchAsync(async (req: Request, res: Response) => {
     region: extractRegion(req), 
     ipAddress: req.ip 
 });
+logDoctorOnboarding(finalId, "SIGNUP", "UNVERIFIED", extractRegion(req)).catch(console.error);
 });
 
 export const getDoctor = catchAsync(async (req: Request, res: Response) => {
@@ -291,6 +292,7 @@ export const verifyDiploma = catchAsync(async (req: Request, res: Response) => {
             // 🟢 HIPAA FIX: Masked PII in SNS Ops Alerts
             const maskedId = `${String(id).substring(0, 4)}****`;
             const regionalSns = new SNSClient({ region: region.toUpperCase() === 'EU' ? 'eu-central-1' : 'us-east-1', credentials });
+            logDoctorOnboarding(id, "AI_VERIFICATION", "PENDING_OFFICER_APPROVAL", region).catch(console.error);
             
             await regionalSns.send(new PublishCommand({
                 TopicArn: process.env.SNS_TOPIC_ARN || "arn:aws:sns:us-east-1:950110266426:mediconnect-ops-alerts",
@@ -385,3 +387,29 @@ export const deleteDoctor = catchAsync(async (req: Request, res: Response) => {
     ipAddress: req.ip 
 });
 });
+
+// 🟢 GDPR FIX: Track doctor onboarding progress
+const logDoctorOnboarding = async (doctorId: string, eventType: string, status: string, region: string) => {
+    try {
+        const saKey = await getSSMParameter("/mediconnect/prod/gcp/service-account", region, true);
+        if (!saKey) return;
+        const credentials = JSON.parse(saKey);
+        const dataset = region.toUpperCase() === 'EU' ? "mediconnect_analytics_eu" : "mediconnect_analytics";
+
+        const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${credentials.project_id}/datasets/${dataset}/tables/doctor_onboarding_logs/insertAll`;
+
+        await fetch(url, {
+            method: "POST",
+            body: JSON.stringify({
+                rows: [{
+                    json: {
+                        doctor_id: doctorId,
+                        event_type: eventType,
+                        status: status,
+                        timestamp: new Date().toISOString()
+                    }
+                }]
+            })
+        });
+    } catch (e) { console.error("BigQuery Onboarding Log Failed"); }
+};

@@ -1,36 +1,42 @@
-# --- PRODUCTION BUILD (Low RAM Optimized) ---
-FROM node:22-alpine
+# --- STAGE 1: BUILDER ---
+FROM node:20-alpine AS builder
+WORKDIR /app
 
-# 1. Setup Work Directory
-WORKDIR /home/node/app
+# 1. Copy the monorepo package files
+COPY backend_v2/package*.json ./
 
-# 🟢 FIX: Create folders & assign permissions BEFORE switching user
-# This prevents the "EACCES: permission denied" error
-RUN mkdir -p node_modules dist && chown -R node:node /home/node/app
+# 2. Create the service directory and copy its package files
+RUN mkdir -p ./communication-service
+COPY backend_v2/communication-service/package*.json ./communication-service/
 
-# 2. Switch to Secure User (HIPAA/GDPR Compliance)
+# 3. Install dependencies at the /app level
+RUN npm ci
+
+# 4. Copy the source code
+COPY backend_v2/shared ./shared
+COPY backend_v2/communication-service ./communication-service
+
+# 5. Build
+WORKDIR /app/communication-service
+RUN ../node_modules/.bin/tsc --project tsconfig.json
+
+# 6. 🟢 DOCKER 100% FIX: Prune dev dependencies at the root level!
+WORKDIR /app
+RUN npm prune --omit=dev 
+
+# --- STAGE 2: RUNNER (Production) ---
+FROM node:20-alpine
+WORKDIR /app
+RUN chown -R node:node /app
 USER node
+
+# 🟢 FIXED PATH: Copy node_modules from the root /app folder, NOT communication-service
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+COPY --from=builder --chown=node:node /app/communication-service/dist ./dist
+COPY --from=builder --chown=node:node /app/communication-service/package*.json ./
 
 ENV NODE_ENV=production
 ENV PORT=8084
-
-# 3. Copy Package Files
-# We use --chown to ensure the 'node' user owns them
-COPY --chown=node:node communication-service/package*.json ./
-
-# 4. Install Production Dependencies
-# Runs fast because we omit heavy dev dependencies
-RUN npm ci --omit=dev && npm cache clean --force
-
-# 5. Copy Pre-Compiled Code (From Windows Host)
-# We copy the 'dist' folder that contains the nested structure (service + shared)
-COPY --chown=node:node communication-service/dist ./dist
-
-# 6. Copy Metadata
-COPY --chown=node:node communication-service/package.json ./package.json
-
 EXPOSE 8084
 
-# 7. Start Service
-# Uses 'npm start' to match the path defined in package.json
-CMD ["npm", "start"]
+CMD ["node", "dist/communication-service/src/index.js"]

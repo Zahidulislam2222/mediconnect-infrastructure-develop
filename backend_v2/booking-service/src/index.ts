@@ -3,30 +3,41 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
+import rateLimit from 'express-rate-limit';
+import { GetParametersCommand } from "@aws-sdk/client-ssm";
+
 import bookingRoutes from './routes/booking.routes';
 import { handleStripeWebhook } from './controllers/webhook.controller';
-import { SSMClient, GetParametersCommand } from "@aws-sdk/client-ssm";
+import { getRegionalSSMClient } from './config/aws'; // 🟢 REGIONAL FACTORY
 
 dotenv.config();
 
 const app = express();
+app.set('trust proxy', 1); // 🟢 REQUIRED for Rate Limiting behind Azure/GCP Load Balancers
+
 const PORT = process.env.PORT || 8083;
+
+// 🟢 SECURITY: DDoS Protection (100 requests / 15 mins)
+const globalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, 
+    max: 100, 
+    message: { error: "Too many requests. Please try again later." }
+});
+app.use(globalLimiter);
 
 // --- 1. COMPLIANT CORS (HIPAA/GDPR) ---
 const allowedOrigins = [
     'http://localhost:8080',
     'http://localhost:5173',
-    /\.web\.app$/,           // Firebase Production
-    /\.azurecontainerapps\.io$/ // Azure Inter-service
+    /\.web\.app$/,
+    /\.azurecontainerapps\.io$/,
+    /\.run\.app$/
 ];
+if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
-if (process.env.FRONTEND_URL) {
-    allowedOrigins.push(process.env.FRONTEND_URL);
-}
-
-// --- 2. SECURITY & MIDDLEWARE ---
+// --- 2. SECURITY MIDDLEWARE ---
 app.use(helmet({
-    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }, // HSTS 1 Year
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
@@ -41,88 +52,66 @@ app.use(cors({
     origin: allowedOrigins,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    // Added FHIR and internal headers
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Internal-Secret', 'X-User-ID', 'Prefer', 'If-Match']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Internal-Secret', 'X-User-ID', 'Prefer', 'If-Match', 'x-user-region']
 }));
 app.options('*', cors());
 
-// 🟢 CRITICAL: Stripe Webhook (Must stay BEFORE express.json)
+// 🟢 CRITICAL: Stripe Webhook MUST be raw buffer (Before express.json)
 app.post('/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
 
-app.use(express.json({ limit: '2mb' })); // Limit payload size
+app.use(express.json({ limit: '2mb' }));
 
-// HIPAA Audit Logging
-app.use(morgan((tokens, req, res) => {
-    return [
-        `[AUDIT]`,
-        tokens.method(req, res),
-        tokens.url(req, res),
-        tokens.status(req, res),
-        tokens['response-time'](req, res), 'ms',
-        `User: ${req.headers['x-user-id'] || 'Guest'}`,
-        `IP: ${req.ip}`
-    ].join(' ');
-}, {
-    skip: (req) => req.method === 'OPTIONS' || req.url === '/health'
-}));
-
-// Health Check
-app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'UP', service: 'booking-service', timestamp: new Date().toISOString() });
+// 🟢 HIPAA AUDIT FIX: Secure Identity Logging (Extracts from JWT, not headers)
+morgan.token('verified-user', (req: any) => {
+    return req.user?.sub || req.user?.id ? `User:${req.user.sub || req.user.id}` : 'Unauthenticated';
 });
 
-// Routes
+app.use(morgan((tokens, req, res) => {
+    return [
+        `[AUDIT]`, tokens.method(req, res), tokens.url(req, res)?.split('?')[0],
+        tokens.status(req, res), tokens['response-time'](req, res), 'ms',
+        tokens['verified-user'](req, res), `IP:${req.ip}`
+    ].join(' ');
+}, { skip: (req) => req.url === '/health' || req.method === 'OPTIONS' }));
+
+// --- 3. ROUTES ---
+app.get('/health', (req, res) => res.status(200).json({ status: 'UP', service: 'booking-service' }));
 app.use('/', bookingRoutes);
 
-// --- 3. FAIL-SAFE SECRETS LOADER ---
+// --- 4. 100% COMPLIANT VAULT SYNC ---
 async function loadSecrets() {
-    // 1. Diagnostic Check
-    const keyHint = process.env.AWS_ACCESS_KEY_ID ? `${process.env.AWS_ACCESS_KEY_ID.substring(0, 8)}...` : 'MISSING';
-    console.log(`🔎 Boot Check: AWS ID [${keyHint}] in [${process.env.AWS_REGION || 'us-east-1'}]`);
-
-    // 2. Early Exit if no keys (Relies on Azure Portal Manual Vars)
-    if (!process.env.AWS_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID.includes('PLACEHOLDER')) {
-        console.warn("⚠️ No AWS Credentials found. Relying on Azure Portal Environment Variables.");
-        return;
-    }
-
-    const ssm = new SSMClient({ 
-        region: process.env.AWS_REGION || 'us-east-1',
-        requestHandler: { connectionTimeout: 2000 } // Don't hang startup
-    });
+    const region = process.env.AWS_REGION || 'us-east-1';
+    const ssm = getRegionalSSMClient(region);
 
     try {
-        console.log("🔐 Attempting to sync secrets from AWS Vault...");
+        console.log(`🔐 Synchronizing Booking secrets with AWS Vault [${region}]...`);
         const command = new GetParametersCommand({
             Names: [
                 '/mediconnect/prod/cognito/user_pool_id',
                 '/mediconnect/prod/cognito/client_id',
-                '/mediconnect/stripe/secret_key',      
-                '/mediconnect/stripe/webhook_secret',
-                // Database secrets needed for Google Calendar Sync
-                '/mediconnect/prod/gcp/sql/public_ip',
-                '/mediconnect/prod/gcp/sql/db_user',
-                '/mediconnect/prod/db/master_password'
+                '/mediconnect/prod/cognito/user_pool_id_eu',
+                '/mediconnect/stripe/keys',      
+                '/mediconnect/stripe/webhook_secret'
             ],
             WithDecryption: true
         });
+
         const { Parameters } = await ssm.send(command);
 
-        Parameters?.forEach(p => {
-            // PROFESSIONAL: Only set if not already defined (Azure Portal wins)
-            if (p.Name === '/mediconnect/prod/cognito/user_pool_id' && !process.env.COGNITO_USER_POOL_ID) process.env.COGNITO_USER_POOL_ID = p.Value;
-            if (p.Name === '/mediconnect/prod/cognito/client_id' && !process.env.COGNITO_CLIENT_ID) process.env.COGNITO_CLIENT_ID = p.Value;
-            if (p.Name === '/mediconnect/stripe/secret_key' && !process.env.STRIPE_SECRET_KEY) process.env.STRIPE_SECRET_KEY = p.Value;
-            if (p.Name === '/mediconnect/stripe/webhook_secret' && !process.env.STRIPE_WEBHOOK_SECRET) process.env.STRIPE_WEBHOOK_SECRET = p.Value;
-            
-            // Map DB secrets for Calendar Sync
-            if (p.Name === '/mediconnect/prod/gcp/sql/public_ip' && !process.env.DB_HOST) process.env.DB_HOST = p.Value;
-            if (p.Name === '/mediconnect/prod/gcp/sql/db_user' && !process.env.DB_USER) process.env.DB_USER = p.Value;
-            if (p.Name === '/mediconnect/prod/db/master_password' && !process.env.DB_PASSWORD) process.env.DB_PASSWORD = p.Value;
+        if (!Parameters || Parameters.length === 0) throw new Error("No secrets found in Parameter Store.");
+
+        Parameters.forEach(p => {
+            if (p.Name?.includes('user_pool_id') && !p.Name.includes('_eu')) process.env.COGNITO_USER_POOL_ID = p.Value;
+            if (p.Name?.includes('client_id')) process.env.COGNITO_CLIENT_ID = p.Value;
+            if (p.Name?.includes('user_pool_id_eu')) process.env.COGNITO_USER_POOL_ID_EU = p.Value;
+            if (p.Name?.includes('stripe/keys')) process.env.STRIPE_SECRET_KEY = p.Value;
+            if (p.Name?.includes('webhook_secret')) process.env.STRIPE_WEBHOOK_SECRET = p.Value;
         });
+
         console.log("✅ AWS Vault Sync Complete.");
     } catch (e: any) {
-        console.warn(`⚠️ Vault Sync Bypass: ${e.message}. Using System Environment Variables.`);
+        console.error(`❌ FATAL: Vault Sync Failed. System cannot start securely.`, e.message);
+        process.exit(1);
     }
 }
 
