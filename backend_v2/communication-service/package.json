@@ -6,7 +6,8 @@
     "scripts": {
         "start": "node dist/communication-service/src/index.js",
         "dev": "nodemon src/index.ts",
-        "build": "tsc"
+        "build": "tsc",
+        "test": "echo \"No tests defined yet\" && exit 0"
     },
     "dependencies": {
         "@aws-sdk/client-apigatewaymanagementapi": "^3.995.0",
