@@ -5,33 +5,32 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 # 1. COPY MANIFESTS (The Skeleton)
-COPY backend_v2/package*.json ./
+COPY backend_v2/package.json ./
 COPY backend_v2/doctor-service/package.json ./doctor-service/
 COPY backend_v2/patient-service/package.json ./patient-service/
 COPY backend_v2/booking-service/package.json ./booking-service/
 COPY backend_v2/communication-service/package.json ./communication-service/
 
-# FIX 1: We DO NOT copy shared/package.json because it does not exist.
-# NPM will simply ignore the empty workspace entry during install.
+# FIX 1: IGNORE LOCAL LOCKFILES
 
-# 2. FIX 2: FORCE HOISTING (The "Cosmos" Fix)
-# We delete the service-level lockfile. This forces NPM to install ALL dependencies
-# (including @azure/cosmos) into the root /app/node_modules folder, ensuring they are saved.
+RUN rm -f package-lock.json
 RUN rm -f communication-service/package-lock.json
 
-# 3. INSTALL
-RUN npm ci
+# FIX 2: REGENERATE FLAT TREE
 
-# 4. COPY SOURCE CODE
-# We copy the 'shared' folder now (as code, not as a package) so TypeScript can read it.
+RUN npm install
+
+# 2. COPY SOURCE CODE
+# We copy the 'shared' folder as source code (since it has no package.json)
 COPY backend_v2/shared ./shared
 COPY backend_v2/communication-service ./communication-service
 
-# 5. BUILD
+# 3. BUILD
 WORKDIR /app/communication-service
 RUN ../node_modules/.bin/tsc --project tsconfig.json
 
-# 6. PRUNE
+# 4. PRUNE
+# Removes dev dependencies while keeping the flat structure
 WORKDIR /app
 RUN npm prune --omit=dev 
 
@@ -43,8 +42,8 @@ WORKDIR /app
 RUN chown -R node:node /app
 USER node
 
-# 7. COPY ARTIFACTS
-# Since we forced hoisting above, all production dependencies are now correctly inside this root folder.
+# 5. COPY ARTIFACTS
+# Because we used "npm install" above, @azure/cosmos is now guaranteed to be in this root folder.
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/communication-service/dist ./dist
 COPY --from=builder --chown=node:node /app/communication-service/package*.json ./
