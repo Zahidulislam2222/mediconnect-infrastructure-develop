@@ -18,10 +18,36 @@ env:
   GCP_SERVICE_ACCOUNT: "data-logger@mediconnect-analytics.iam.gserviceaccount.com"
 
 jobs:
+
+   # ==========================================
+  # 🛡️ GATEKEEPER: Run Tests & Linting
+  # ==========================================
+  test-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "🧰 Setup Node.js"
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: backend_v2/package-lock.json
+
+      - name: "📦 Install Dependencies"
+        run: |
+          cd backend_v2
+          npm ci
+
+      - name: "🧪 Run Unit Tests"
+        run: |
+          cd backend_v2
+          npm test
+
   # ==========================================
   # 🩺 DOCTOR SERVICE JOBS (Untouched)
   # ==========================================
   deploy-doctor-azure-us:
+    needs: [test-and-lint]
     runs-on: "ubuntu-latest"
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +80,7 @@ jobs:
           environmentVariables: "NODE_ENV=production AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=secretref:aws-access-key-id AWS_SECRET_ACCESS_KEY=secretref:aws-secret-access-key"
 
   deploy-doctor-gcp-eu:
+    needs: [test-and-lint]
     runs-on: "ubuntu-latest"
     steps:
       - uses: actions/checkout@v4
@@ -87,6 +114,7 @@ jobs:
   # 🛌 PATIENT SERVICE JOBS (Untouched)
   # ==========================================
   deploy-patient-gcp-us:
+    needs: [test-and-lint]
     runs-on: "ubuntu-latest"
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +145,7 @@ jobs:
             --update-secrets "AWS_ACCESS_KEY_ID=aws_access_key_id:latest,AWS_SECRET_ACCESS_KEY=aws_secret_access_key:latest"
 
   deploy-patient-gcp-eu:
+    needs: [test-and-lint]
     runs-on: "ubuntu-latest"
     steps:
       - uses: actions/checkout@v4
@@ -150,6 +179,7 @@ jobs:
   # 📅 BOOKING SERVICE JOBS (NEW)
   # ==========================================
   deploy-booking-azure-us:
+    needs: [test-and-lint]
     runs-on: "ubuntu-latest"
     steps:
       - uses: actions/checkout@v4
@@ -182,6 +212,7 @@ jobs:
           environmentVariables: "NODE_ENV=production AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=secretref:aws-access-key-id AWS_SECRET_ACCESS_KEY=secretref:aws-secret-access-key"
 
   deploy-booking-gcp-eu:
+    needs: [test-and-lint]
     runs-on: "ubuntu-latest"
     steps:
       - uses: actions/checkout@v4
@@ -215,6 +246,7 @@ jobs:
   # 📡 COMMUNICATION SERVICE JOBS (NEW)
   # ==========================================
   deploy-communication-azure-us:
+    needs: [test-and-lint]
     runs-on: "ubuntu-latest"
     steps:
       - uses: actions/checkout@v4
@@ -247,6 +279,7 @@ jobs:
           environmentVariables: "NODE_ENV=production AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=secretref:aws-access-key-id AWS_SECRET_ACCESS_KEY=secretref:aws-secret-access-key"
 
   deploy-communication-gcp-eu:
+    needs: [test-and-lint]
     runs-on: "ubuntu-latest"
     steps:
       - uses: actions/checkout@v4
