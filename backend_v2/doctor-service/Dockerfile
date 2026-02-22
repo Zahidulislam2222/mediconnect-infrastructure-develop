@@ -1,36 +1,47 @@
-# --- STAGE 1: BUILDER ---
+# ==========================================
+# STAGE 1: BUILDER (The Professional Skeleton)
+# ==========================================
 FROM node:20-alpine AS builder
 WORKDIR /app
 
-# 1. Copy the monorepo package files
-COPY backend_v2/package*.json ./
+# 1. WORKSPACE SKELETON
+# We copy all package manifests so the lockfile stays valid.
+COPY backend_v2/package.json ./
+COPY backend_v2/doctor-service/package.json ./doctor-service/
+COPY backend_v2/patient-service/package.json ./patient-service/
+COPY backend_v2/booking-service/package.json ./booking-service/
+COPY backend_v2/communication-service/package.json ./communication-service/
 
-# 2. Create the service directory and copy its package files
-RUN mkdir -p ./doctor-service
-COPY backend_v2/doctor-service/package*.json ./doctor-service/
+# 2. THE HOISTING FIX
+# We delete the nested lockfile if it exists to prevent "missing module" errors later.
+RUN rm -f doctor-service/package-lock.json
 
-# 3. Install dependencies at the /app level
-RUN npm ci
+# 3. INSTALL
+# We use 'npm install' to resolve a fresh, flat tree in the cloud context.
+RUN npm install
 
-# 4. Copy the source code
+# 4. COPY CODE & BUILD
 COPY backend_v2/shared ./shared
 COPY backend_v2/doctor-service ./doctor-service
 
-# 5. Build
 WORKDIR /app/doctor-service
 RUN ../node_modules/.bin/tsc --project tsconfig.json
 
-# 6. 🟢 DOCKER 100% FIX: Prune dev dependencies at the root level!
+# 5. PRUNE
 WORKDIR /app
 RUN npm prune --omit=dev 
 
-# --- STAGE 2: RUNNER (Production) ---
+# ==========================================
+# STAGE 2: RUNNER (Security & Compliance)
+# ==========================================
 FROM node:20-alpine
 WORKDIR /app
+
+# 6. SECURITY: Non-root user for HIPAA/GDPR compliance
 RUN chown -R node:node /app
 USER node
 
-# 🟢 FIXED PATH: Copy node_modules from the root /app folder, NOT doctor-service
+# 7. COPY ARTIFACTS
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/doctor-service/dist ./dist
 COPY --from=builder --chown=node:node /app/doctor-service/package*.json ./
