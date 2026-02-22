@@ -1,4 +1,4 @@
-name: "🚀 Global Multi-Cloud Deploy (Doctor & Patient)"
+name: "🚀 Global Multi-Cloud Deploy (Mediconnect Suite)"
 
 on:
   push:
@@ -6,6 +6,8 @@ on:
     paths:
       - 'backend_v2/doctor-service/**'
       - 'backend_v2/patient-service/**'
+      - 'backend_v2/booking-service/**'
+      - 'backend_v2/communication-service/**'
       - 'backend_v2/shared/**'
 
 env:
@@ -17,7 +19,7 @@ env:
 
 jobs:
   # ==========================================
-  # 🩺 DOCTOR SERVICE JOBS
+  # 🩺 DOCTOR SERVICE JOBS (Untouched)
   # ==========================================
   deploy-doctor-azure-us:
     runs-on: "ubuntu-latest"
@@ -82,7 +84,7 @@ jobs:
             --update-secrets "AWS_ACCESS_KEY_ID=aws_access_key_id:latest,AWS_SECRET_ACCESS_KEY=aws_secret_access_key:latest"
 
   # ==========================================
-  # 🛌 PATIENT SERVICE JOBS (GCP ONLY)
+  # 🛌 PATIENT SERVICE JOBS (Untouched)
   # ==========================================
   deploy-patient-gcp-us:
     runs-on: "ubuntu-latest"
@@ -104,7 +106,6 @@ jobs:
       - name: "🚀 Deploy GCP Cloud Run (Patient US)"
         run: |
           IMAGE_TAG=${{ env.GCP_REPO }}/patient-service-us:${{ github.sha }}
-          # 🟢 Deploys to US Region (us-central1), using Port 8081
           gcloud run deploy patient-service-us \
             --image "$IMAGE_TAG" \
             --project ${{ env.GCP_PROJECT_ID }} \
@@ -135,12 +136,141 @@ jobs:
       - name: "🚀 Deploy GCP Cloud Run (Patient EU)"
         run: |
           IMAGE_TAG=${{ env.GCP_REPO }}/patient-service-eu:${{ github.sha }}
-          # 🟢 GDPR: Deploys strictly to EU Region (europe-west3), using Port 8081
           gcloud run deploy patient-service-eu \
             --image "$IMAGE_TAG" \
             --project ${{ env.GCP_PROJECT_ID }} \
             --region europe-west3 \
             --port 8081 \
+            --platform managed \
+            --service-account ${{ env.GCP_SERVICE_ACCOUNT }} \
+            --set-env-vars "NODE_ENV=production,AWS_REGION=eu-central-1" \
+            --update-secrets "AWS_ACCESS_KEY_ID=aws_access_key_id:latest,AWS_SECRET_ACCESS_KEY=aws_secret_access_key:latest"
+
+  # ==========================================
+  # 📅 BOOKING SERVICE JOBS (NEW)
+  # ==========================================
+  deploy-booking-azure-us:
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
+      - run: find . -name ".dockerignore" -delete
+      
+      - name: "🐳 Build and Push Booking US to Azure"
+        run: |
+          IMAGE_TAG=${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/booking-service:${{ github.sha }}
+          docker build -t $IMAGE_TAG -f backend_v2/booking-service/Dockerfile .
+          docker push $IMAGE_TAG
+
+      - name: "🔐 Push Secrets to Azure"
+        run: |
+          az containerapp secret set \
+            --name booking-service \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --secrets "aws-access-key-id=${{ secrets.AWS_ACCESS_KEY_ID }}" "aws-secret-access-key=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+      
+      - name: "🚀 Deploy Azure Container App"
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          acrName: ${{ env.AZURE_CONTAINER_REGISTRY }}
+          containerAppName: "booking-service"
+          resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
+          imageToDeploy: "${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/booking-service:${{ github.sha }}"
+          environmentVariables: "NODE_ENV=production AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=secretref:aws-access-key-id AWS_SECRET_ACCESS_KEY=secretref:aws-secret-access-key"
+
+  deploy-booking-gcp-eu:
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+      - run: find . -name ".dockerignore" -delete
+        
+      - name: "🐳 Build and Push Booking EU to GCP"
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/booking-service-eu:${{ github.sha }}
+          docker build -t $IMAGE_TAG -f backend_v2/booking-service/Dockerfile .
+          docker push $IMAGE_TAG
+
+      - name: "🚀 Deploy GCP Cloud Run (Booking EU)"
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/booking-service-eu:${{ github.sha }}
+          gcloud run deploy booking-service-eu \
+            --image "$IMAGE_TAG" \
+            --project ${{ env.GCP_PROJECT_ID }} \
+            --region europe-west3 \
+            --port 8083 \
+            --platform managed \
+            --service-account ${{ env.GCP_SERVICE_ACCOUNT }} \
+            --set-env-vars "NODE_ENV=production,AWS_REGION=eu-central-1" \
+            --update-secrets "AWS_ACCESS_KEY_ID=aws_access_key_id:latest,AWS_SECRET_ACCESS_KEY=aws_secret_access_key:latest"
+
+  # ==========================================
+  # 📡 COMMUNICATION SERVICE JOBS (NEW)
+  # ==========================================
+  deploy-communication-azure-us:
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
+      - run: find . -name ".dockerignore" -delete
+      
+      - name: "🐳 Build and Push Comm US to Azure"
+        run: |
+          IMAGE_TAG=${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/communication-service:${{ github.sha }}
+          docker build -t $IMAGE_TAG -f backend_v2/communication-service/Dockerfile .
+          docker push $IMAGE_TAG
+
+      - name: "🔐 Push Secrets to Azure"
+        run: |
+          az containerapp secret set \
+            --name communication-service \
+            --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+            --secrets "aws-access-key-id=${{ secrets.AWS_ACCESS_KEY_ID }}" "aws-secret-access-key=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+      
+      - name: "🚀 Deploy Azure Container App"
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          acrName: ${{ env.AZURE_CONTAINER_REGISTRY }}
+          containerAppName: "communication-service"
+          resourceGroup: ${{ env.AZURE_RESOURCE_GROUP }}
+          imageToDeploy: "${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/communication-service:${{ github.sha }}"
+          environmentVariables: "NODE_ENV=production AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=secretref:aws-access-key-id AWS_SECRET_ACCESS_KEY=secretref:aws-secret-access-key"
+
+  deploy-communication-gcp-eu:
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+      - run: find . -name ".dockerignore" -delete
+        
+      - name: "🐳 Build and Push Comm EU to GCP"
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/communication-service-eu:${{ github.sha }}
+          docker build -t $IMAGE_TAG -f backend_v2/communication-service/Dockerfile .
+          docker push $IMAGE_TAG
+
+      - name: "🚀 Deploy GCP Cloud Run (Comm EU)"
+        run: |
+          IMAGE_TAG=${{ env.GCP_REPO }}/communication-service-eu:${{ github.sha }}
+          gcloud run deploy communication-service-eu \
+            --image "$IMAGE_TAG" \
+            --project ${{ env.GCP_PROJECT_ID }} \
+            --region europe-west3 \
+            --port 8084 \
             --platform managed \
             --service-account ${{ env.GCP_SERVICE_ACCOUNT }} \
             --set-env-vars "NODE_ENV=production,AWS_REGION=eu-central-1" \
