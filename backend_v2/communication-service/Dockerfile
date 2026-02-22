@@ -4,18 +4,18 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 
-# 1. COPY MANIFESTS (The Skeleton)
+# 1. COPY MANIFESTS
 COPY backend_v2/package.json ./
-COPY backend_v2/package-lock.json ./ 
 COPY backend_v2/doctor-service/package.json ./doctor-service/
 COPY backend_v2/patient-service/package.json ./patient-service/
 COPY backend_v2/booking-service/package.json ./booking-service/
 COPY backend_v2/communication-service/package.json ./communication-service/
 
-# NOTE: We DO NOT copy shared/package.json because it does not exist.
+# 2. THE WORKING FIX: IGNORE LOCKFILES & FLAT INSTALL
+RUN rm -f package-lock.json
+RUN rm -f communication-service/package-lock.json
 
-# 2. THE PERFECT INSTALL (npm ci)
-RUN npm ci
+RUN npm install
 
 # 3. COPY SOURCE CODE
 COPY backend_v2/shared ./shared
@@ -26,7 +26,6 @@ WORKDIR /app/communication-service
 RUN ../node_modules/.bin/tsc --project tsconfig.json
 
 # 5. PRUNE
-# 'npm prune' works perfectly with the lockfile to remove dev dependencies.
 WORKDIR /app
 RUN npm prune --omit=dev 
 
@@ -39,7 +38,6 @@ RUN chown -R node:node /app
 USER node
 
 # 6. COPY ARTIFACTS
-# Since we used 'npm ci' with a correct lockfile, @azure/cosmos is guaranteed to be in the root node_modules.
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/communication-service/dist ./dist
 COPY --from=builder --chown=node:node /app/communication-service/package*.json ./
